@@ -31,6 +31,7 @@ ge.toml
 /launch_online_2p.bat
 /launch_online_2p.ps1
 /CODEGEN COMMAND.txt
+/backtrace.txt
 
 # --- Editor / OS ---
 .vs/

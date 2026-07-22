@@ -26,7 +26,7 @@ set(GE_SOURCES
 )
 
 if(WIN32)
-    add_executable(ge WIN32 ${GE_SOURCES})
+    add_executable(ge ${GE_SOURCES})
 elseif(ANDROID)
     # NativeActivity loads this as a shared library (android.app.lib_name=ge).
     # The android_main entry + app-glue come from the SDK via rexglue_setup_target.
