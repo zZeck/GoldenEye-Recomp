@@ -1,220 +1,205 @@
-Support me on Ko-fi: https://ko-fi.com/lucio1992xerus
-
-# GoldenEye 007 — PC Recompilation
+# GoldenEye 007 — PC Recompilation (zZeck integration fork)
 
 A native PC port of **GoldenEye 007 (Xbox 360 / XBLA)**, built by *statically
 recompiling* the original game into C++ with the
 [ReXGlue SDK](https://github.com/jeffory/GoldenEye-Recomp-rexglue). No emulator —
-the game runs as a real native executable.
+the game runs as a real native executable on **Windows** and **Linux**.
 
 > [!IMPORTANT]
-> **This repository contains _no_ game code or assets.** It is only the
-> source that wraps the game (menus, hooks, online, post-FX, build
-> config). You must find the game files yourself. This game never released publically
+> **This repository contains _no_ game code or assets.** It is only the source
+> that wraps the game (menus, hooks, online, post-FX, build config). You must
+> supply the game files yourself. This game never released publicly.
 
-## Features
+## About this fork
 
-- Runs natively on **Windows** and **Linux** — no emulator, no BIOS — with an
-  experimental **Android** (arm64) build.
-- Controller support.
-- **Online multiplayer** — host or join matches over the internet (LAN, Hamachi,
-  playit.gg, or a public server). See [Playing online](#playing-online).
+This is an integration fork that merges the work of several GoldenEye-Recomp
+contributors, adds a **Linux → Windows cross-compile**, and fixes a number of
+genuine bugs (audio, input, GPU pacing, online multiplayer). It is built and
+tested primarily on **Linux** (native x86-64 build, plus an llvm-mingw
+cross-compiled Windows build from the same tree).
+
+Full commit history and credits are in git; the summary of who did what is in
+[Features & credits](#features--credits) below.
+
+## Features & credits
+
+Upstream lineage — everyone forked from SunJaycy's original GoldenEye fork of
+the ReXGlue SDK:
+
+- **[SunJaycy](https://github.com/SunJaycy/GoldenEye-Recomp)** — the original
+  GoldenEye recompilation, plus master-volume, live-FXAA and vsync-default
+  audio/GPU tweaks.
+- **[LucioXerus](https://github.com/LucioXerus/GoldenEye-Recomp)** — the base
+  this fork tracks: native Linux support (Wayland/GTK/Vulkan), post-FX filters,
+  pause/settings menu, online multiplayer client.
+- **[jeffory](https://github.com/jeffory/GoldenEye-Recomp)** — extensive
+  additions merged here: 1:1 keyboard & mouse-look, weapon quick-select,
+  perf/telemetry tooling, pipeline disk-cache, crash/audio fixes, and the
+  (inert on desktop) Android + dual-screen framework.
+- **[mrfox-1](https://github.com/mrfox-1/GoldenEye-Recomp)** — reverse-engineered
+  **native XACT music-transition restoration** (the watch cue, Mission Select
+  cue, and the N64 dynamic X-track states the leaked XBLA build left stubbed).
+- **[nexus382](https://github.com/nexus382/007-Goldeneye-Recomp-TnT)** — the
+  controller-vibration toggle idea (reworked here to the SDK's cross-platform
+  rumble layer).
+
+Player-facing features:
+
+- Runs natively on **Windows** and **Linux** — no emulator, no BIOS.
+- Steady **60 FPS** (optimized Release build; the debug build is much slower).
+- Controller support, plus **1:1 keyboard & mouse-look** (mouse aim without the
+  analog deadzone/accel of stick emulation).
+- **Weapon quick-select** — number keys `1`–`9` jump to a carried weapon, scroll
+  wheel steps next/previous (see [Weapon quick select](#weapon-quick-select)).
+- **Online multiplayer** — host or join over the internet via a matchmaker/relay
+  (see [Playing online](#playing-online)). Works cross-platform between the
+  Linux and Windows builds.
+- Restored **in-game music transitions** (watch/pause cue, Mission Select,
+  dynamic level X-tracks).
 - In-game **pause / settings menu** (ESC): video, resolution, frame limit,
-  fullscreen, online setup.
-- **Post-FX** filters (brightness, contrast, saturation, vignette, presets…).
-- **Weapon quick select** — instant switching via number keys / scroll wheel on
-  PC, or a touch menu on the second screen of dual-screen Android handhelds.
-  See [Weapon quick select](#weapon-quick-select).
-- Smooth, stable 60 FPS (recompiled, with GPU-pacing fixes for the original's
-  frame timing).
+  fullscreen, controller vibration, post-FX, online setup.
+- **Post-FX** filters (brightness, contrast, saturation, vignette, presets).
 
-## Download & Play
+### Notable fixes in this fork
 
-Grab the latest prebuilt release from the **[Releases](../../releases)** page
-(**Windows x64**, **Linux x86-64**, and an experimental **Android arm64-v8a**
-APK are attached), then drop your own GoldenEye 007 game files into the `assets/`
-folder next to the binary. Run `ge.exe` on Windows or `./ge` on Linux; on Android
-install the (debug-signed) APK.
+- **Linux → Windows cross-compile** with llvm-mingw (build a Windows `.exe` from
+  a Linux host; see [Building](#building-from-source)).
+- **Audio**: fixed a producer-thread wake race (store-visibility TOCTOU) that
+  caused intermittent no-sound-at-boot / audio dropouts.
+- **Input**: fixed a mouse-look crash (window API called off the UI thread) and a
+  mouse-look tracking bug on the warp path; guarded XI2 raw-motion setup so it
+  no longer crashes on XWayland (falls back to warp-based look).
+- **Multiplayer**: fixed weapon quick-select randomly cycling on online clients
+  (the weapon block is now read relative to the local player, not players[0]).
+- **Startup**: fixed a false "missing game files" launch veto when started
+  without an explicit `--game_data_root`.
+- **GPU**: 16-byte-aligned the guest `jmp_buf` (setjmp crash) and other
+  cross-compile/runtime fixes.
 
-- 🎮 **Want to play online?** Someone needs to run a server. Download it here →
-  **[GoldenEye-Recomp-Server](https://github.com/SunJaycy/GoldenEye-Recomp-Server)**
-- 🛠️ **Want to modify the engine / recompiler?** It's built on a modified ReXGlue
-  SDK (with the Linux + Android port) →
-  **[GoldenEye-Recomp-rexglue](https://github.com/jeffory/GoldenEye-Recomp-rexglue)**
+## Download & play
+
+Grab a prebuilt zip (or build it yourself — see [Building](#building-from-source)).
+Two Windows package shapes are produced by the packaging script:
+
+- **With assets** — unzip and run `GoldenEye.exe`; everything is in the folder.
+- **Binaries only** (`-nodata`) — put your own game files in a folder named
+  `assets/` next to `GoldenEye.exe`, then run it.
+
+On Linux, run `./GoldenEye` from a folder containing `assets/` and the runtime
+`.so` files. A console window / terminal shows log output; that is normal.
+
+> [!NOTE]
+> You supply your own GoldenEye 007 XBLA game files. They go in an `assets/`
+> folder next to the executable (so the game finds `assets/default.xex`, etc.).
 
 ## Playing online
 
-1. One person runs the **[server](https://github.com/SunJaycy/GoldenEye-Recomp-Server)**
+1. One person runs a **[server](https://github.com/SunJaycy/GoldenEye-Recomp-Server)**
    and shares its address + port.
-2. Everyone opens **ESC → ONLINE** in the game, enters their **username**, the
-   **server address**, the **port**, ticks *Enable online play*, and hits
-   **Save & Restart**.
+2. Everyone opens **ESC → ONLINE**, enters their **username**, the **server
+   address** and **port**, ticks *Enable online play*, and hits **Save & Restart**.
 3. Host a match; the others find and join it.
 
-Because players connect *out* to the server, no port-forwarding is needed for
-joiners — only the host's server port has to be reachable.
+Because players connect *out* to the server, joiners need no port-forwarding —
+only the host's server port has to be reachable. Linux and Windows builds
+interoperate (same wire protocol).
 
 ## Weapon quick select
 
-Switching weapons is **instant** — the port calls the game's own weapon-switch
-routine directly instead of cycling through the inventory, so jumping from the
-first weapon to the last takes one press. It's enabled by default and there are
-two ways to use it, depending on platform:
+Switching weapons is **instant** — the port drives the game's own weapon-switch
+routine instead of cycling the inventory. Enabled by default:
 
-- **PC (keyboard & mouse):**
-  - **Number keys `1`–`9`** — jump straight to the Nth weapon you're carrying
-    (in inventory order).
-  - **Mouse scroll wheel** — scroll up/down to step to the next/previous
-    carried weapon.
-- **Android (dual-screen handhelds, e.g. AYN Thor):** the bottom touch panel
-  shows a live weapon menu — every carried weapon with its ammo count, with the
-  currently equipped one highlighted. **Tap a weapon to switch to it.** The main
-  game on the top screen is unaffected. On single-screen devices the menu simply
-  doesn't appear; nothing else changes.
+- **Number keys `1`–`9`** — jump straight to the Nth carried weapon.
+- **Scroll wheel** — step to the next/previous carried weapon.
 
-The feature can be tuned via cvars: `ge_weapon_select_enable` turns it on/off,
-and `ge_key_wpn_next` / `ge_key_wpn_prev` rebind the next/previous keys
-(defaults `WheelUp` / `WheelDown`).
+Tunable via cvars: `ge_weapon_select_enable` toggles it; `ge_key_wpn_next` /
+`ge_key_wpn_prev` rebind the wheel step (defaults `WheelUp` / `WheelDown`).
 
-## Building from source (advanced)
+## Building from source
 
-Most people should just use the [Releases](../../releases). To build it yourself
-you need the recompiler toolchain and your own copy of the game.
+You need a local checkout of the **ReXGlue SDK submodule** (included here as
+`GoldenEye-Recomp-rexglue/`), **CMake 3.25+**, **Ninja**, **Python 3**, and your
+own **GoldenEye 007 XBLA game files** in `assets/`.
 
-### Common prerequisites (all platforms)
+Both platforms use [CMake presets](CMakePresets.json). Configure presets:
+`linux-amd64` and `win-amd64`; build presets add a `-debug` / `-release` /
+`-relwithdebinfo` suffix. **Use Release for actual play** — the debug build is
+dramatically slower (no inlining / LTO).
 
-- The [ReXGlue SDK](https://github.com/jeffory/GoldenEye-Recomp-rexglue) — a local
-  checkout that provides the `rexglue` CLI + runtime. The build points at it via
-  `-DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue`.
-- **CMake 3.25+**, a **C++23 Clang** toolchain, and **Python 3** (used by codegen).
-- Your own **GoldenEye 007 XBLA game files**, placed in `assets/`.
+### 1. One-time codegen (turns your game copy into recompiled C++)
 
-Every build starts with the same codegen step, run once from the repo root. It
-turns *your* game copy into recompiled C++ under `generated/`:
+Run once from the repo root. It reads your `assets/` and emits C++ under
+`generated/`:
 
 ```sh
-rexglue codegen --max_jump_table_entries 2048 ge_config.toml
+GoldenEye-Recomp-rexglue/out/linux-amd64/Debug/rexglue codegen ge_manifest.toml
 ```
 
-The desktop builds use [CMake presets](CMakePresets.json). Each platform/arch has
-`-debug`, `-release`, and `-relwithdebinfo` variants
-(`win-amd64`, `win-arm64`, `linux-amd64`, `linux-arm64`); swap the preset name in
-the commands below to pick a different target or build type.
+(You need the `rexglue` codegen tool built first — it is produced by configuring
+either preset below, which builds the SDK in-tree. On a fresh tree, configure
+first, run codegen, then build the `ge` target.)
 
-### Linux (x86-64)
+### Linux (native x86-64)
 
-- **Clang 18+** with **libc++** (`-stdlib=libc++`) — the SDK uses `std::expected` /
-  `std::jthread`. The presets invoke plain `clang` / `clang++`; if your distro
-  only ships versioned binaries (e.g. `clang-20`), either symlink them or override
-  `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER`.
-- **Ninja** (the presets' generator).
-- To install dependencies: 
-- Debian/Ubuntu:
+Clang with libc++ (the SDK uses `std::expected` / `std::jthread`), Vulkan, GTK3,
+Wayland, SDL3. On Debian/Ubuntu:
 
 ```sh
-sudo apt install \
-  git cmake ninja-build build-essential pkg-config python3 \
-  clang llvm lld libsdl3-dev libvulkan-dev \
-  vulkan-tools mesa-vulkan-drivers \
-  libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
-  libxcursor-dev libxi-dev libasound2-dev \
-  libwayland-dev libdrm-dev libudev-dev
+sudo apt install git cmake ninja-build build-essential pkg-config python3 \
+  clang llvm lld libsdl3-dev libvulkan-dev vulkan-tools mesa-vulkan-drivers \
+  libgtk-3-dev libx11-dev libxcb1-dev libxi-dev libwayland-dev wayland-protocols \
+  libasound2-dev
 ```
-- Fedora:
+
+Configure and build (Release):
 
 ```sh
-sudo dnf install \
-  git cmake ninja-build pkgconf-pkg-config python3 \
-  clang llvm lld SDL3-devel vulkan-loader-devel \
-  vulkan-tools mesa-vulkan-drivers \
-  mesa-libGL-devel libX11-devel libXrandr-devel libXinerama-devel \
-  libXcursor-devel libXi-devel alsa-lib-devel \
-  wayland-devel libdrm-devel systemd-devel
-```
-- Then you can build an optimized build specifically for your machine:
-```sh
-# 1. Build the ReXGlue SDK (codegen tool + runtime library).
-cd GoldenEye-Recomp-rexglue
-mkdir -p build && cd build
-cmake .. \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_LINKER_TYPE=LLD \
-  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-  -DCMAKE_C_FLAGS="-march=native -mtune=native" \
-  -DCMAKE_CXX_FLAGS="-march=native -mtune=native"
-cd ..
-cmake --build build -j$(nproc)
-
-# 2. Generate the recompiled game code from your game files.
-cd ..
-REX_MAX_JUMP_TABLE_ENTRIES=2048 ./GoldenEye-Recomp-rexglue/out/linux-amd64/rexglue codegen ge_manifest.toml
-
-# 3. Configure the game project (links against the rexglue SDK in-tree).
-cmake --preset linux-amd64-release \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-    -DCMAKE_LINKER_TYPE=LLD \
-    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-    -DCMAKE_C_FLAGS="-march=native -mtune=native" \
-    -DCMAKE_CXX_FLAGS="-march=native -mtune=native" \
-    -DREXSDK_DIR=GoldenEye-Recomp-rexglue/
-
-# 4. Build.
-cmake --build --preset linux-amd64-release -j$(nproc)
-mkdir release
-cp out/build/linux-amd64-release/ge release/
-cp GoldenEye-Recomp-rexglue/out/linux-amd64/librexruntime.so release/
-cp GoldenEye-Recomp-rexglue/out/linux-amd64/libTracyClient.so release/
-cp -r assets release/
+cmake --preset linux-amd64
+cmake --build --preset linux-amd64-release --target ge --parallel $(nproc)
 ```
 
-### Windows (x64)
+The binary is `out/build/linux-amd64/Release/GoldenEye` and the runtime library
+is `GoldenEye-Recomp-rexglue/out/linux-amd64/Release/librexruntime.so`. Stage
+both (plus `libTracyClient.so`) next to your `assets/` and run `./GoldenEye`.
 
-- **Clang** (LLVM, `clang` / `clang++`) inside a **Visual Studio (MSVC)**
-  environment — open an *x64 Native Tools* developer prompt so the MSVC headers
-  and libs are on `PATH`.
-- **Ninja** and **CMake** (both ship with the VS installer's CMake component).
+### Windows (llvm-mingw cross-compile, from a Linux host)
 
-```bat
-:: After running codegen above, from the x64 Native Tools prompt:
-cmake --preset win-amd64-relwithdebinfo -DREXSDK_DIR=C:\path\to\GoldenEye-Recomp-rexglue
-cmake --build --preset win-amd64-relwithdebinfo
-:: Binary: out\build\win-amd64-relwithdebinfo\ge.exe
-```
-
-### Android (arm64-v8a, experimental)
-
-Builds an APK with Gradle + the NDK, which drives this same CMake. `arm64-v8a`
-only (the guest reserves a 4 GiB address space).
-
-- Android SDK + **NDK 27.1.12297006** (Vulkan-capable).
-- The ReXGlue SDK checkout, passed as `-PrexSdkDir` (default
-  `../../GoldenEye-Recomp-rexglue`).
+This fork builds the Windows `.exe` **from Linux** using
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw). Install llvm-mingw and
+point the toolchain file at it (see
+[`cmake/toolchain-llvm-mingw-x86_64.cmake`](cmake/toolchain-llvm-mingw-x86_64.cmake),
+which auto-detects the compiler and runtime-DLL directory). Then:
 
 ```sh
-# After running codegen above:
-cd android
-./gradlew assembleRelease -PrexSdkDir=/path/to/GoldenEye-Recomp-rexglue
-# APK: android/app/build/outputs/apk/release/
+cmake --preset win-amd64
+cmake --build --preset win-amd64-release --target ge --parallel $(nproc)
 ```
 
-Install the (debug-signed) APK on a controller-equipped device. On-device
-game-asset delivery is still being wired up, and cold boot uses an auto-retry
-watchdog. See [`android/README.md`](android/README.md) for how the
-NativeActivity / Vulkan-surface shell wires together, and
-[`docs/boot-startup-race.md`](docs/boot-startup-race.md) for the boot race.
+Output: `out/build/win-amd64/Release/GoldenEye.exe` plus the runtime DLLs
+(`librexruntime.dll`, `libc++.dll`, `libunwind.dll`, `libTracyClient.dll`).
 
-> [!NOTE]
-> **Continuous integration.** Every push is compile-verified on **Linux, Windows,
-> and Android** via GitHub Actions
-> ([`.github/workflows/build.yml`](.github/workflows/build.yml)): it checks the
-> hand-written engine sources against the SDK headers on all three platforms. CI
-> can't produce the final `ge` binary — that needs generated PPC code from *your*
-> own game copy.
+Run under Wine for a quick smoke test:
 
-source lives in [`src/`](src/):
-`ge_app` (app + window/menus glue), `ge_menu` (pause/settings menu),
-`ge_hooks` (mid-asm fixups), `ge_postfx` (filters). `ge_manifest.toml` /
+```sh
+WINEDEBUG=-all wine GoldenEye.exe   # from a folder containing assets/ + the DLLs
+```
+
+### Packaging a Windows zip
+
+[`scripts/package_windows.sh`](scripts/package_windows.sh) bundles the Windows
+Release build into `dist/`:
+
+```sh
+scripts/package_windows.sh              # binaries + your assets/
+scripts/package_windows.sh --no-assets  # binaries only (user supplies assets/)
+```
+
+## Source layout
+
+Hand-written engine glue lives in [`src/`](src/): `ge_app` (app + window/menu
+glue), `ge_menu` (pause/settings menu), `ge_hooks` (mid-asm fixups, input,
+mouse-look, weapon-select, music), `ge_gamestate` (weapon/inventory bridge),
+`ge_postfx` (filters), `ge_online` (in the SDK). `ge_manifest.toml` /
 `ge_config.toml` drive the recompiler.
 
 ## Legal
@@ -228,4 +213,4 @@ PC build. Don't ask for or share game files.
 
 The original code in this repository is released into the **public domain**
 ([The Unlicense](LICENSE)). The ReXGlue SDK it builds against has its own
-(BSD-3) license.
+(BSD-3) license. Merged contributions remain credited to their authors above.
