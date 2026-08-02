@@ -1091,6 +1091,15 @@ class GameInputListener final : public rex::ui::WindowInputListener,
 
   // Engage/release capture + recenter. Independent of the FP-mode gate (matches
   // upstream): keeps the cursor hidden + pinned whenever look is on and focused.
+  //
+  // The rex::ui::Window state API (CaptureMouse / WarpMouseToClient / cursor
+  // visibility) is NOT thread-safe -- each call pushes a WindowDestructionReceiver
+  // onto the window's single non-atomic LIFO stack. tick_capture() runs both from
+  // UI-thread event handlers AND from the guest input hook (ge_inject_keyboard, a
+  // guest thread), so calling the window directly races that stack and trips
+  // `innermost_destruction_receiver_ == this` (crash observed mid-gameplay on the
+  // Win32 window). Marshal every window touch onto the UI thread; CallInUIThread
+  // runs inline when we are already the UI thread and enqueues otherwise.
   void tick_capture() {
     if (!window_) return;
     std::lock_guard<std::mutex> cl(cap_m_);
@@ -1098,15 +1107,21 @@ class GameInputListener final : public rex::ui::WindowInputListener,
                       window_->HasFocus();
     if (want && !captured_) {
       captured_ = true;
-      window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
-      window_->CaptureMouse();
+      rex::ui::Window* w = window_;
+      w->app_context().CallInUIThread([w] {
+        w->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+        w->CaptureMouse();
+      });
       std::lock_guard<std::mutex> l(m_);  // no spike on capture start
       dx_ = 0.f; dy_ = 0.f; have_prev_ = false;
       raw_motion_ = false;  // re-arm the warp fallback until raw deltas flow again
     } else if (!want && captured_) {
       captured_ = false;
-      window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
-      window_->ReleaseMouse();
+      rex::ui::Window* w = window_;
+      w->app_context().CallInUIThread([w] {
+        w->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+        w->ReleaseMouse();
+      });
     }
     if (captured_) {
       // Re-center each tick (prevents edge clamping). Seed prev to the center
@@ -1114,7 +1129,8 @@ class GameInputListener final : public rex::ui::WindowInputListener,
       const int cx = static_cast<int>(window_->GetActualLogicalWidth() / 2);
       const int cy = static_cast<int>(window_->GetActualLogicalHeight() / 2);
       { std::lock_guard<std::mutex> l(m_); prev_x_ = cx; prev_y_ = cy; have_prev_ = true; }
-      window_->WarpMouseToClient(cx, cy);
+      rex::ui::Window* w = window_;
+      w->app_context().CallInUIThread([w, cx, cy] { w->WarpMouseToClient(cx, cy); });
     }
   }
 
