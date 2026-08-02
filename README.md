@@ -88,6 +88,18 @@ Two Windows package shapes are produced by the packaging script:
 On Linux, run `./GoldenEye` from a folder containing `assets/` and the runtime
 `.so` files. A console window / terminal shows log output; that is normal.
 
+> [!TIP]
+> On some Wayland sessions the game may come up as a white/blank window when
+> launched normally. If that happens, launch it with `WAYLAND_DISPLAY=1`:
+>
+> ```sh
+> WAYLAND_DISPLAY=1 ./GoldenEye
+> ```
+>
+> (The game runs fine under both native Wayland and XWayland; if it falls back
+> to XWayland, XI2 raw mouse motion is unavailable and it uses warp-based
+> mouse-look automatically.)
+
 > [!NOTE]
 > You supply your own GoldenEye 007 XBLA game files. They go in an `assets/`
 > folder next to the executable (so the game finds `assets/default.xex`, etc.).
@@ -160,7 +172,9 @@ cmake --build --preset linux-amd64-release --target ge --parallel $(nproc)
 
 The binary is `out/build/linux-amd64/Release/GoldenEye` and the runtime library
 is `GoldenEye-Recomp-rexglue/out/linux-amd64/Release/librexruntime.so`. Stage
-both (plus `libTracyClient.so`) next to your `assets/` and run `./GoldenEye`.
+both (plus `libTracyClient.so`) next to your `assets/` and run `./GoldenEye`
+(or `WAYLAND_DISPLAY=1 ./GoldenEye` if you get a blank window — see the tip in
+[Download & play](#download--play)).
 
 ### Windows (llvm-mingw cross-compile, from a Linux host)
 
