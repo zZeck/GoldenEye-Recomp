@@ -20,8 +20,7 @@
     <application
         android:allowBackup="false"
         android:label="GoldenEye 007"
-        android:debuggable="true"
-        android:extractNativeLibs="true"
+        android:extractNativeLibs="${extractNativeLibs}"
         android:resizeableActivity="false"
         android:hasCode="true">
 
@@ -32,7 +31,7 @@
             android:launchMode="singleTask"
             android:resizeableActivity="false"
             android:screenOrientation="sensorLandscape"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            android:theme="@style/GeTheme">
 
             <meta-data android:name="android.app.lib_name" android:value="ge" />
 

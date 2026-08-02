@@ -22,6 +22,9 @@ the game runs as a real native executable.
 - In-game **pause / settings menu** (ESC): video, resolution, frame limit,
   fullscreen, online setup.
 - **Post-FX** filters (brightness, contrast, saturation, vignette, presets…).
+- **Weapon quick select** — instant switching via number keys / scroll wheel on
+  PC, or a touch menu on the second screen of dual-screen Android handhelds.
+  See [Weapon quick select](#weapon-quick-select).
 - Smooth, stable 60 FPS (recompiled, with GPU-pacing fixes for the original's
   frame timing).
 
@@ -50,6 +53,28 @@ install the (debug-signed) APK.
 
 Because players connect *out* to the server, no port-forwarding is needed for
 joiners — only the host's server port has to be reachable.
+
+## Weapon quick select
+
+Switching weapons is **instant** — the port calls the game's own weapon-switch
+routine directly instead of cycling through the inventory, so jumping from the
+first weapon to the last takes one press. It's enabled by default and there are
+two ways to use it, depending on platform:
+
+- **PC (keyboard & mouse):**
+  - **Number keys `1`–`9`** — jump straight to the Nth weapon you're carrying
+    (in inventory order).
+  - **Mouse scroll wheel** — scroll up/down to step to the next/previous
+    carried weapon.
+- **Android (dual-screen handhelds, e.g. AYN Thor):** the bottom touch panel
+  shows a live weapon menu — every carried weapon with its ammo count, with the
+  currently equipped one highlighted. **Tap a weapon to switch to it.** The main
+  game on the top screen is unaffected. On single-screen devices the menu simply
+  doesn't appear; nothing else changes.
+
+The feature can be tuned via cvars: `ge_weapon_select_enable` turns it on/off,
+and `ge_key_wpn_next` / `ge_key_wpn_prev` rebind the next/previous keys
+(defaults `WheelUp` / `WheelDown`).
 
 ## Building from source (advanced)
 

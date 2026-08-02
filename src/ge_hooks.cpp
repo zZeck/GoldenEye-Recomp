@@ -1,5 +1,7 @@
 // ge - project mid-ASM hooks: 0x830E0xxx fragment reconstruction.
 #include <thread>
+#include <algorithm>  // std::min/std::max (ge_mouse_camera aim/sway clamps)
+#include <cmath>      // sqrtf (ge_mouse_camera crosshair distance)
 //
 // 8 functions branch to 0x830E0xxx, ZERO in the static XEX (rexglue codegen
 // stubs it) but at runtime real PPC code (identical to fragments IDA
@@ -15,15 +17,27 @@
 #include <cstring>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include "ge_fps.h"    // ge::FpsOnFrame (guest-FPS benchmark recorder)
+#include "ge_gamestate.h"  // ge::gamestate::OnFrame (game-state bridge pump)
+#include "ge_dualscreen.h"  // ge::DualScreen (second-screen weapon menu pacing)
+#include "ge_touchpad.h"    // ge::TouchPad (on-screen touch controls -> guest pad)
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
+#include <rex/perf/counter.h>  // rex::perf frame-stage counters (GESPIKE)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
+#include <rex/system/fault_diag.h>  // write-watch fault diagnostics (GEWATCHDOG dump)
 #include <rex/system/xmemory.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/system/xthread.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/keybinds.h>      // ParseVirtualKey (keyboard rebinding)
+#include <rex/ui/virtual_key.h>
+#include <rex/ui/window.h>        // mouse capture / cursor / warp (cross-platform)
+#include <rex/ui/window_listener.h>
+#include <rex/ui/ui_event.h>
 #include <cstdio>
+#include <mutex>
 #include <string>
 
 #if defined(_WIN32)
@@ -47,14 +61,6 @@ REXCVAR_DEFINE_BOOL(ge_freeze_diag, false, "GPU",
                     "GoldenEye: enable the freeze watchdog + per-stall pipeline diagnostics "
                     "(heavy logging + guest-thread stack walks; OFF in shipping builds)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-// CP-progress handshake, defined in the rexglue base repo's command_processor.cpp.
-// rex_ge_cp_progress_seq() snapshots a counter the CP worker bumps on every ring
-// drain; rex_ge_cp_wait_progress() blocks until that counter moves past the
-// snapshot (real CP progress) or the bounded timeout elapses -- replacing the
-// old std::this_thread::yield() busy-spin on the GPU-completion path.
-extern "C" uint64_t rex_ge_cp_progress_seq();
-extern "C" void rex_ge_cp_wait_progress(uint64_t last_seq, uint32_t timeout_us);
 
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
@@ -144,6 +150,10 @@ struct CPProbe : rex::graphics::CommandProcessor {
 std::atomic<uint32_t> g_present_cpcnt{0};
 // Guest tick at the last present, for a bounded completion wait.
 std::atomic<uint32_t> g_present_tb{0};
+// Count of 80ms GPU-wait skip-bit fallback EPISODES in ge_dbg_now (one per stall
+// stretch, not per poll). Logged in the GEWATCHDOG STALL dump so a captured
+// lock-up shows whether the render-side skip-bit fallback fired.
+std::atomic<uint32_t> g_skipbit_fallback_fires{0};
 inline rex::graphics::CommandProcessor* ge_cp() {
   auto* ks = rex::system::kernel_state();
   if (!ks) return nullptr;
@@ -189,7 +199,32 @@ inline void STF32(uint8_t* b, uint32_t ga, float f) {
   uint32_t v; std::memcpy(&v, &f, 4); v = __builtin_bswap32(v);
   std::memcpy(b + ga, &v, 4);
 }
+inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
+  uint16_t v = __builtin_bswap16(val); std::memcpy(b + ga, &v, 2);
+}
 }  // namespace
+
+// rexglue CP WAIT_REG_MEM >60ms deadlock-breaker fire count (command_processor.cpp).
+// Lets the watchdog report whether the CPU<->GPU fence breaker fired in a lock-up.
+extern "C" uint32_t rex_ge_cp_wait_reg_mem_timeouts();
+// rexglue CP drain-progress sequence (command_processor.cpp). Stagnant while the
+// ring is non-empty = the CP worker isn't getting scheduled (starvation).
+extern "C" uint64_t rex_ge_cp_progress_seq();
+
+// Discovery diagnostic toggle, defined in ge_gamestate.cpp. Declared here so
+// ge_dbg_weapon_apply (below) can gate its logging without a header dependency.
+REXCVAR_DECLARE(bool, ge_gamestate_diag);
+
+// CP-starvation episodes observed by the watchdog (ring non-empty but the CP
+// progress seq did not advance across a 250ms watchdog tick). Coarse by design
+// -- fine-grained starvation shows up as missing time in the per-frame CP
+// counters instead. Read by the GESPIKE log line (ge_fps.cpp).
+std::atomic<uint64_t> g_cp_starved_episodes{0};
+namespace ge {
+uint64_t GetCpStarvedEpisodes() {
+  return g_cp_starved_episodes.load(std::memory_order_relaxed);
+}
+}  // namespace ge
 
 // ===========================================================================
 // Freeze watchdog. Auto-detects the visual freeze (the guest keeps presenting
@@ -202,11 +237,47 @@ std::atomic<uint32_t> g_ge_device{0};   // device struct (dev) seen by ge_dbg_no
 std::atomic<uint32_t> g_ge_idblk{0};    // id-block (idblk) seen by ge_dbg_now
 std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
 
+// Decode the SDK's write-watch fault diagnostics into ge.log. Called from the
+// watchdog thread (normal context - logging is fine here). `full` also dumps
+// the event ring; the summary line alone is cheap enough for periodic use.
+void ge_dump_fault_diag(bool full) {
+  auto& d = rex::system::fault_diag();
+  REXKRNL_INFO(
+      "GEWWDIAG wwf={} early_abort={} cb_handled={} cb_unhandled={} recovered={} "
+      "recovery_fatal={} vetoes={} any_watched_false={} rearm={} protect_ro_watched={} "
+      "shadow_disagree={} failsafe={} consec_max={}",
+      d.ww_faults_total.load(), d.early_abort_hits.load(), d.cb_handled.load(),
+      d.cb_unhandled.load(), d.recovered.load(), d.recovery_fatal.load(),
+      d.unprotect_vetoes.load(), d.any_watched_false.load(), d.rearm_races.load(),
+      d.protect_ro_watched.load(), d.shadow_disagreements.load(), d.failsafe_fires.load(),
+      d.consecutive_max.load());
+  if (!full) return;
+  static const char* kPathNames[] = {
+      "none",      "early_abort", "cb_handled",   "cb_unhandled", "recovered",
+      "rec_fatal", "rec_lied",    "veto",         "no_watch",     "rearm",
+      "protect_ro", "failsafe",   "shadow_lied"};
+  // Oldest-first up to the ring size; skip never-written slots.
+  uint32_t next = d.ring_next.load(std::memory_order_relaxed);
+  for (uint32_t k = 0; k < rex::system::FaultDiag::kRingSize; ++k) {
+    const auto& r = d.ring[(next + k) & (rex::system::FaultDiag::kRingSize - 1)];
+    if (r.path == 0) continue;
+    const char* name =
+        r.path < sizeof(kPathNames) / sizeof(kPathNames[0]) ? kPathNames[r.path] : "?";
+    REXKRNL_INFO(
+        "GEWWRING seq={} t={}.{:06}s path={} host={:#x} guest={:#010x} pc={:#x} heap={:#010x} "
+        "gpage={} cur={} state={} detail={}",
+        r.fault_seq, r.timestamp_ns / 1000000000ull, (r.timestamp_ns % 1000000000ull) / 1000,
+        name, r.host_addr, r.guest_vaddr, r.pc, r.heap_base, r.guest_page, r.current_protect,
+        r.page_state, r.detail);
+  }
+}
+
 void ge_watchdog_thread() {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
   uint32_t present_at_stall_start = 0, dbg_at_stall_start = 0, submit_at_stall_start = 0;
   uint32_t stall = 0;
+  uint64_t last_cp_seq = 0;
   bool logged = false;
   bool recover_fired = false;
   for (;;) {
@@ -215,11 +286,128 @@ void ge_watchdog_thread() {
     if (!cp) continue;
     uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
     uint32_t rpi = static_cast<CPProbe*>(cp)->rpi();
+
+    // CP starvation: work queued (ring non-empty) but the CP's drain-progress
+    // seq didn't move across a whole 250ms tick -> the worker isn't being
+    // scheduled. One episode per stagnant tick; surfaced in GESPIKE.
+    uint64_t cp_seq = rex_ge_cp_progress_seq();
+    if (rpi != wpi && cp_seq == last_cp_seq) {
+      g_cp_starved_episodes.fetch_add(1, std::memory_order_relaxed);
+    }
+    last_cp_seq = cp_seq;
+
+    // Audio-emitter pool occupancy (GEEFFPOOL). The 200x32B X3DAudio emitter
+    // pool at 0x83064E00 (allocator sub_82144058: slot word0 == 0 means free)
+    // is the suspected "sound drops after minutes of play" culprit: once it
+    // pins at 200/200, every new positional sound silently fails to spawn --
+    // and the spawner's unchecked NULL write is what fires GEWWFAILSAFE.
+    // Sample used slots each tick: WARN on the full transition, note the
+    // recovery, and heartbeat 1/5s so a session log shows occupancy vs time.
+    {
+      static uint32_t pool_prev_used = 0;
+      static int pool_log_div = 0;
+      uint32_t pool_used = 0;
+      for (uint32_t s = 0; s < 200u; ++s) {
+        if (LD32(base, 0x83064E00u + s * 32u) != 0u) ++pool_used;
+      }
+      if (pool_used == 200u && pool_prev_used < 200u) {
+        REXKRNL_WARN("GEEFFPOOL FULL 200/200 - new positional sounds drop until slots free");
+      } else if (pool_prev_used == 200u && pool_used < 200u) {
+        REXKRNL_INFO("GEEFFPOOL recovered {}/200", pool_used);
+      }
+      pool_prev_used = pool_used;
+      if (++pool_log_div >= 20) {  // ~5s at the 250ms tick
+        pool_log_div = 0;
+        REXKRNL_INFO("GEEFFPOOL used={}/200", pool_used);
+      }
+    }
+
     uint32_t present = g_present_cpcnt.load(std::memory_order_relaxed);
     uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
     uint32_t idblk = g_ge_idblk.load(std::memory_order_relaxed);
     uint32_t submit = dev ? LD32(base, dev + 16544) : 0;
+
+    // TOTAL-FREEZE trigger. The original stall trigger below requires presents
+    // to stay ALIVE while the ring freezes -- a real 23-minute-session lockup
+    // (guest wedged in a SIGSEGV/maps-parse storm) stopped present# too and
+    // the watchdog stayed silent by design. Catch the everything-stopped case:
+    // the guest was clearly booted (dev known, submit>0) but neither submit
+    // nor present# moved for ~3s. Log once per episode with the state that
+    // identified the last one, plus the on-attach recipe.
+    {
+      static uint32_t tf_last_submit = 0, tf_last_present = 0, tf_ticks = 0;
+      static bool tf_logged = false;
+      if (dev && submit != 0 && submit == tf_last_submit && present == tf_last_present) {
+        if (++tf_ticks >= 12 && !tf_logged) {  // 12 x 250ms = ~3s of nothing
+          tf_logged = true;
+          uint32_t presented = LD32(base, dev + 16552);
+          uint32_t rg = LD32(base, 0x8242043Cu);
+          REXKRNL_INFO(
+              "GEWATCHDOG TOTAL-FREEZE: no submit/present progress ~3s | submit={} presented={} "
+              "present#={} | ring rpi={:#x} wpi={:#x} [{}] | cp_seq={} dbgnow_polls={} | "
+              "render-gate={} | skipbit-fires={} wrm-timeouts={} starved={}",
+              submit, presented, present, rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), cp_seq,
+              dbg, rg, g_skipbit_fallback_fires.load(std::memory_order_relaxed),
+              rex_ge_cp_wait_reg_mem_timeouts(),
+              g_cp_starved_episodes.load(std::memory_order_relaxed));
+          REXKRNL_INFO(
+              "GEWATCHDOG TOTAL-FREEZE: last-frame stages cpexec={}us cpidle={}us wrm={}us "
+              "present={}us gwait={}us gpu={}us strans={}us pcomp={}us texup={}us gio={}us "
+              "| if a guest thread is burning CPU, attach with: "
+              "run-as com.sunjaycy.goldeneye simpleperf record -g -p <pid>",
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpExecuteUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpIdleUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpWaitRegMemUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPresentBlockUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestGpuWaitUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGpuFrameUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kShaderTranslateUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPipelineCompileUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureUploadUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestFileIoUs));
+          // Full write-watch fault anatomy: if a guest thread is wedged in a
+          // fault loop, the ring holds the decisions of its last iterations.
+          ge_dump_fault_diag(/*full=*/true);
+        }
+      } else {
+        tf_ticks = 0;
+        tf_logged = false;
+      }
+      tf_last_submit = submit;
+      tf_last_present = present;
+    }
+
+    // Write-watch anomaly watcher: the failsafe, unprotect vetoes, shadow
+    // disagreements and recovery events should all be zero in a healthy
+    // session. Log (rate-limited) the moment any of them move so the event is
+    // timestamped against GESPIKE/GESHOWN context even when no freeze follows.
+    {
+      auto& wwd = rex::system::fault_diag();
+      static uint64_t ww_last_failsafe = 0, ww_last_anom = 0, ww_last_recovered = 0;
+      static uint32_t ww_cooldown = 0;
+      if (ww_cooldown) --ww_cooldown;
+      uint64_t failsafe = wwd.failsafe_fires.load(std::memory_order_relaxed);
+      uint64_t anom = wwd.unprotect_vetoes.load(std::memory_order_relaxed) +
+                      wwd.shadow_disagreements.load(std::memory_order_relaxed) +
+                      wwd.rearm_races.load(std::memory_order_relaxed) +
+                      wwd.protect_ro_watched.load(std::memory_order_relaxed);
+      uint64_t recov = wwd.recovered.load(std::memory_order_relaxed) +
+                       wwd.recovery_fatal.load(std::memory_order_relaxed);
+      if (failsafe != ww_last_failsafe) {
+        REXKRNL_INFO("GEWWFAILSAFE fired (total={}) - a fault-looping page was force-unprotected",
+                     failsafe);
+        ge_dump_fault_diag(/*full=*/true);
+        ww_last_failsafe = failsafe;
+        ww_last_anom = anom;
+        ww_last_recovered = recov;
+      } else if ((anom != ww_last_anom || recov != ww_last_recovered) && ww_cooldown == 0) {
+        ge_dump_fault_diag(/*full=*/false);
+        ww_cooldown = 20;  // at most one summary per ~5s
+        ww_last_anom = anom;
+        ww_last_recovered = recov;
+      }
+    }
 
     bool present_alive = (present != last_present);
     bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
@@ -236,7 +424,9 @@ void ge_watchdog_thread() {
       // release the CP). The render is parked waiting on GPU completion ->
       // deadlock. Write 0 to release the CP: it drains the buffer, delivers the
       // completion, the render resumes. Memory-only, no interrupt (safe).
-      if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu) {
+      // Active recovery WRITES guest memory, so it is opt-in via ge_freeze_diag;
+      // the default-on watchdog only observes + logs.
+      if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu && REXCVAR_GET(ge_freeze_diag)) {
         ST32(base, idblk, 0u);  // release the CP's WAIT_REG_MEM semaphore
         if (!recover_fired) {
           recover_fired = true;
@@ -247,17 +437,31 @@ void ge_watchdog_thread() {
         logged = true;
         uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
         uint32_t target = dev ? LD32(base, dev + 10908) : 0;
-        uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+        // idblk+0 is the WAIT_REG_MEM CPU<->GPU semaphore (the render writes 0 to
+        // RELEASE the CP), NOT a completion counter -- so a value of 0 is the
+        // normal released state. Report it as "semaphore=" and never infer "GPU
+        // behind" from it (the old "submit > completed" test compared a frame
+        // count against this semaphore and so trivially read "GPU BEHIND").
+        uint32_t semaphore = idblk ? LD32(base, idblk + 0) : 0;
         uint32_t skip = dev ? (base[dev + 10941] & 2) : 0;
         REXKRNL_INFO(
             "GEWATCHDOG STALL: ring rpi={:#x} wpi={:#x} [{}] | present#={} (+{}/stall) | "
-            "dbgnow_polls={} (+{}/stall) | submit={} completed={} target={} presented={} skipbit={} "
-            "| dev={:#x} idblk={:#x}",
+            "dbgnow_polls={} (+{}/stall) | submit={} presented={} target={} semaphore(idblk+0)={} "
+            "skipbit={} | dev={:#x} idblk={:#x}",
             rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), present, present - present_at_stall_start,
-            dbg, dbg - dbg_at_stall_start, submit, completed, target, presented, skip, dev, idblk);
+            dbg, dbg - dbg_at_stall_start, submit, presented, target, semaphore, skip, dev, idblk);
+        // Residual render-path stall mechanisms (cumulative fire counts): which one
+        // tripped tells us whether this lock-up is the CPU<->GPU fence deadlock
+        // (WAIT_REG_MEM breaker) or the guest GPU-wait giving up (skip-bit fallback).
         REXKRNL_INFO(
-            "GEWATCHDOG -> completion={} | presenting={} | producer={} | polling={}",
-            (submit > completed ? "GPU BEHIND (completion not delivered)" : "caught up"),
+            "GEWATCHDOG -> residual fires: skipbit-fallback(80ms)={} | WAIT_REG_MEM-breaker(60ms)={}",
+            g_skipbit_fallback_fires.load(std::memory_order_relaxed),
+            rex_ge_cp_wait_reg_mem_timeouts());
+        REXKRNL_INFO(
+            "GEWATCHDOG -> render={} | presenting={} | producer={} | polling={}",
+            // The real freeze mechanism: the guest latched the skip bit and is
+            // bypassing the GPU-completion wait, so render is skipped every frame.
+            (skip ? "SKIP-BIT LATCHED (render skipped every frame)" : "skip-bit clear"),
             (submit > presented ? "frames NOT presenting" : "caught up"),
             (submit != submit_at_stall_start ? "ALIVE (submitting)" : "STALLED (not submitting)"),
             (dbg != dbg_at_stall_start ? "guest spinning in sub_82198C28" : "guest NOT polling"));
@@ -449,7 +653,11 @@ void ge_watchdog_thread() {
 }
 
 inline void ge_start_watchdog_once() {
-  if (!REXCVAR_GET(ge_freeze_diag)) return;  // diagnostics off in shipping builds
+  // Detection + logging run by DEFAULT (a 250ms-poll detached thread, negligible
+  // cost) so a rare in-the-wild lock-up is captured in ge.log without needing
+  // ge_freeze_diag set ahead of time. The active memory-write auto-recovery
+  // inside the loop stays gated behind ge_freeze_diag, so the default behaviour is
+  // purely observational.
   static std::atomic<bool> started{false};
   bool expected = false;
   if (started.compare_exchange_strong(expected, true)) {
@@ -488,10 +696,6 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   g_ge_idblk.store(idblk, std::memory_order_relaxed);
   g_dbgnow_calls.fetch_add(1, std::memory_order_relaxed);
   ge_start_watchdog_once();
-  // Snapshot the CP progress counter BEFORE sampling CP state below, so a drain
-  // that lands between our sample and our wait is not lost (the wait re-checks).
-  // Only consumed by the arm64 blocking-wait path below; unused on desktop.
-  [[maybe_unused]] uint64_t cp_seq = rex_ge_cp_progress_seq();
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->counter() : 0;
   uint32_t rpi = cpp ? static_cast<CPProbe*>(cpp)->rpi() : 0;
@@ -542,36 +746,47 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   // this stays a one-shot "proceed past this stall", not a permanent skip.
   static thread_local uint32_t s_wait_start = 0;
   static thread_local bool s_waiting = false;
+  static thread_local bool s_fallback_counted = false;
   if (!drawn) {
-    if (!s_waiting) { s_waiting = true; s_wait_start = t; }
+    if (!s_waiting) { s_waiting = true; s_wait_start = t; s_fallback_counted = false; }
     else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
       drawn = true;
       if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
+      // Count once per stall episode (this branch re-runs every poll while the
+      // stall persists); the watchdog reports it as a residual-mechanism signal.
+      if (!s_fallback_counted) {
+        s_fallback_counted = true;
+        g_skipbit_fallback_fires.fetch_add(1, std::memory_order_relaxed);
+      }
     }
-    // The six GPU-completion waits poll this routine. How we wait here is
-    // arch-gated, because the right answer depends on core count:
+    // The six GPU-completion waits poll this routine. Yield the core back so the
+    // rexglue CP worker (the thread that advances the ring read pointer / swap
+    // counter to satisfy (a)/(b)) can run; we re-check (a)/(b) on the next poll.
     //
-    //  - arm64 handhelds (few cores): a TIGHT yield busy-spin oversubscribes the
-    //    cores and starves the rexglue CP worker (the very thread that must
-    //    advance the ring read pointer / swap counter to satisfy (a)/(b)), so the
-    //    fence never advances and the spin never exits = freeze. Instead BLOCK on
-    //    real CP progress: the CP worker bumps the seq behind rex_ge_cp_progress_seq
-    //    on every drain, waking us the instant it advances. Bounded timeout just
-    //    lets the ~80ms skip-bit fallback above still run. No core burned.
-    //
-    //  - desktop x86-64 (many cores): the CP worker always gets a core, so the
-    //    plain yield is correct AND the blocking wait actively regresses boot --
-    //    it froze GoldenEye on the very first intro screen (render skipped every
-    //    frame while the loop ran at 60fps). Confirmed by bisect: main (yield)
-    //    boots to the menu, the blocking-wait commit freezes. Keep the yield here.
+    // This is now unified across arches. It used to be arch-gated: arm64 blocked
+    // on rex_ge_cp_wait_progress because a tight yield busy-spin from dozens of
+    // guest threads oversubscribed the few handheld cores and starved the CP
+    // worker (the fence never advanced -> freeze). But the blocking wait
+    // re-checks only every ~2ms, so the ~80ms skip-bit fallback above latches and the game
+    // wedges (render skipped every frame) -- the SAME freeze the desktop bisect
+    // (commit 9dd0258) pinned on the blocking wait. The real fix is to stop the
+    // starvation at its source: the CP worker is now created at kAboveNormal
+    // priority (command_processor.cpp), so it stays scheduled even while guest
+    // threads yield-spin -- making the proven-good desktop yield path correct on
+    // arm64 too. Keep the yield; the rexglue handshake API stays defined as a
+    // cheap escape hatch if the priority boost ever proves insufficient.
     if (!drawn) {
-#if defined(__aarch64__)
-      rex_ge_cp_wait_progress(cp_seq, 2000u);  // <=2ms, woken on progress
-#else
       std::this_thread::yield();
-#endif
     }
   } else {
+    if (s_waiting) {
+      // Wait episode over: bill the yield-spin to the per-frame stage
+      // counters (guest timebase ticks -> us; /50 approximates the 49.875MHz
+      // timebase within 0.25%). Summed across ALL waiting guest threads, so
+      // it reads as total thread-time blocked on the GPU, not wall time.
+      rex::perf::IncrementCounter(rex::perf::CounterId::kGuestGpuWaitUs,
+                                  static_cast<int64_t>((uint32_t)(t - s_wait_start) / 50u));
+    }
     s_waiting = false;
   }
 
@@ -584,6 +799,44 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // >60ms deadlock-breaker log polling exactly this address.)
     ST32(base, dev + 16552, LD32(base, dev + 16544));   // presented := submit
     ST32(base, idblk + 60, rpi);                        // ring RPTR write-back
+
+    // Real-render heartbeat. This branch runs ONLY when the guest actually
+    // consumed a GPU completion (drawn) and advanced presented:=submit -- i.e. a
+    // frame really reached the screen. Unlike the "GEGPU present#" heartbeat (and
+    // the CP swap counter), which keep advancing on a FROZEN boot (VdSwap still
+    // fires, render skipped), this one stops the instant the game wedges. The
+    // Android boot loader (GoldenEyeActivity.hasStartedPresenting) greps for it so
+    // a frozen boot is detected and relaunched instead of mistaken for "live".
+    //
+    // Count REAL frames, not poll iterations: this branch runs thousands of times
+    // per frame (the guest polls the GPU wait in a tight loop), so gate on the
+    // submit counter (dev+16544) actually advancing, then log once per 64 frames.
+    uint32_t submit = LD32(base, dev + 16544);
+    // Dedup the frame transition ATOMICALLY. The six GPU-completion waits poll
+    // this branch from multiple guest threads; a plain read-modify-write let two
+    // of them observe the same submit advance and both run the body -- a benign
+    // dup for the heartbeat, but it double-counted the frame in the FPS recorder
+    // (two OnFrame() calls microseconds apart -> bogus sub-ms frames that wrecked
+    // the best-frame metric). A CAS makes exactly one caller win each distinct
+    // submit value, so OnFrame() fires once per real frame.
+    static std::atomic<uint32_t> s_last_submit{0};
+    static std::atomic<uint32_t> rendered{0};
+    uint32_t prev_submit = s_last_submit.load(std::memory_order_relaxed);
+    if (submit != prev_submit &&
+        s_last_submit.compare_exchange_strong(prev_submit, submit,
+                                              std::memory_order_relaxed)) {
+      // How many frames the counter really advanced by: a poll can miss an
+      // intermediate submit value (clear+present pairs, catch-up after a
+      // hitch), and telling the recorder lets it split the elapsed time into
+      // per-frame samples instead of booking one doubled "slow" frame. Wrap-
+      // safe u32 subtract; the recorder clamps to [1,4]. prev_submit==0 means
+      // first observation -> treat as a single frame.
+      uint32_t adv = (prev_submit != 0) ? (submit - prev_submit) : 1u;
+      ge::FpsOnFrame(adv);  // feed the FPS benchmark recorder
+      uint32_t old = rendered.fetch_add(1, std::memory_order_relaxed);
+      if ((old & 0x3F) == 0)  // log #1, #65, #129... (boot loader greps >= 65)
+        REXKRNL_INFO("GEGPU rendered#{} dev={:#x} submit={}", old + 1, dev, submit);
+    }
   }
 }
 
@@ -597,7 +850,7 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
 // counter has moved past this -- i.e. the just-submitted frame was really
 // drawn -- so the game blocks for the real render (visible) but no longer.
 void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx; (void)base;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   (void)r30;
   uint32_t a1 = r31.u32;
   auto* cpp = ge_cp();
@@ -605,9 +858,27 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
   g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
 
-  static uint32_t n = 0;                       // throttled fps heartbeat (diag only)
-  if ((n++ & 0x3F) == 0 && REXCVAR_GET(ge_freeze_diag))
+  // Throttled present heartbeat. This is ALSO the boot-success signal the Android
+  // loader (GoldenEyeActivity.hasStartedPresenting) greps ge.log for ("present#N",
+  // N >= PRESENT_THRESHOLD); it must NOT be gated behind ge_freeze_diag (default
+  // off) or the loader never detects a live render loop and retries/spins forever
+  // even though the guest is presenting. One line per ~64 presents is negligible.
+  static uint32_t n = 0;
+  if ((n++ & 0x3F) == 0)
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
+
+  // Pump the game-state bridge once per present (== once per displayed frame):
+  // snapshot carried weapons / ammo / equipped id for the second-screen weapon
+  // menu, and apply any pending equip request. Inert until the guest inventory
+  // layout is confirmed on-device (see ge_gamestate.cpp); safe to call here.
+  ge::gamestate::OnFrame(ctx, base);
+
+  // Pace the second-screen weapon menu: request one UI-thread paint of the
+  // secondary surface for this frame. Runs on the game thread, so it only posts
+  // a deferred UI-thread tick (the secondary surface must be touched only there)
+  // -- and it is a cheap no-op when there is no second screen / the feature is
+  // off, which is the single-screen fallback. See ge_dualscreen.cpp.
+  ge::DualScreen::Get().OnGuestPresent();
 }
 
 // F3  0x830E0670 (site 0x8209F5F0 sub_8209F5D8 -> ge_cont_8209F5F4)
@@ -727,22 +998,940 @@ void ge_hook_830E0750(PPCRegister& r7, PPCRegister& r8, PPCRegister& r11,
 }
 
 // ===========================================================================
-// BeanTools Community Edition data-patch bootstrap. Applies the data-only CE
-// bug-fixes (ge_ce_patches.cpp) exactly once, the first time the guest polls
-// input. The data segment is live in guest RAM by the first input poll (menu),
-// which precedes any level load -- so the fixed setup/fog/BG data is in place
-// before the first level reads it. This stripped-down hook carries none of the
-// upstream keyboard/mouse machinery (this fork has no mouse-look feature).
+// Mouse-look (real 1:1 keyboard/mouse looking, replacing the stick-emulation
+// path). We inject raw mouse deltas straight into the guest's per-frame look
+// state inside ge_bondview_control (sub_820B99E8), so the mouse drives the same
+// heading/pitch the right stick does -- but without the analog deadzone/accel/
+// turn-rate cap that makes the built-in MnK stick emulation feel terrible.
+//
+// The look injection is platform-neutral (pure guest-memory writes). The input
+// SOURCE (relative mouse delta, key-down state, cursor capture) is supplied by
+// GameInputListener below, a cross-platform rex::ui::WindowInputListener built
+// on the Window abstraction (Win32 + GTK), replacing upstream's Win32-only raw
+// input thread.
+//
+// Mouse and controller both work AT ONCE (additive). While mouse-look is on we
+// capture the OS cursor (hidden + centered) during play, and release it whenever
+// the pause menu is open or the window loses focus.
 // ===========================================================================
-void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
 
-void ge_ce_bootstrap() {
+// Mouse-look tunables, ported from the xenia-canary mousehook cvars. The
+// user-facing sensitivity multiplier is ge_mouse_sens (defined below).
+REXCVAR_DEFINE_BOOL(ge_invert_x, false, "Input", "Invert mouse X (horizontal) look");
+REXCVAR_DEFINE_BOOL(ge_invert_y, false, "Input", "Invert mouse Y (vertical) look");
+REXCVAR_DEFINE_BOOL(ge_disable_autoaim, true, "Input",
+                    "Disable auto-aim and look-ahead while mouse-look is on");
+REXCVAR_DEFINE_DOUBLE(ge_menu_sensitivity, 1.0, "Input",
+                      "Mouse sensitivity in menus").range(0.05, 20.0);
+REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
+                      "Crosshair travel in aim-mode before the camera turns [0-1]").range(0.0, 1.0);
+REXCVAR_DEFINE_BOOL(ge_gun_sway, true, "Input", "Gun sway as the camera turns");
+
+REXCVAR_DEFINE_DOUBLE(ge_mouse_sens, 1.0, "Input", "Mouse look sensitivity").range(0.05, 20.0);
+REXCVAR_DEFINE_DOUBLE(ge_mouse_smooth, 0.0, "Input",
+                      "Mouse look smoothing, EMA over per-frame deltas (0 = off/raw .. 0.9 = heavy)")
+    .range(0.0, 0.9);
+// Mouse-look on/off. ON: the mouse looks (added on top of the pad -- both work
+// at once, so you can put the controller down) and the cursor is captured during
+// play. OFF: no mouse-look, cursor free, controller only.
+REXCVAR_DEFINE_BOOL(ge_mouselook_enable, true, "Input",
+                    "Mouse look (works alongside the controller; captures the cursor in-game)");
+
+namespace {
+bool ge_mouselook_on() { return REXCVAR_GET(ge_mouselook_enable); }
+
+// Cross-platform mouse/keyboard source. Registered on the rexglue display
+// window, it accumulates relative mouse delta + a key-down table (read by the
+// guest mid-asm hooks) and owns the cursor-capture lifecycle through the Window
+// abstraction. Modeled on rexglue's MnkInputDriver, which uses the identical
+// Win32+GTK capture/warp/delta pattern. Listener callbacks fire on the UI
+// thread; the guest hooks read on guest threads, so shared state is guarded.
+class GameInputListener final : public rex::ui::WindowInputListener,
+                                public rex::ui::WindowListener {
+ public:
+  void Attach(rex::ui::Window* w) {
+    window_ = w;
+    if (window_) {
+      window_->AddInputListener(this, /*z_order=*/0);
+      window_->AddListener(this);
+    }
+  }
+
+  // Per-frame consumption by the look hook (reset-on-read). Float: raw XI2
+  // deltas are sub-pixel, and slow precise aim lives in the fractions.
+  float take_dx() { std::lock_guard<std::mutex> l(m_); float v = dx_; dx_ = 0.f; return v; }
+  float take_dy() { std::lock_guard<std::mutex> l(m_); float v = dy_; dy_ = 0.f; return v; }
+
+  bool key_down(rex::ui::VirtualKey vk) const {
+    uint16_t idx = static_cast<uint16_t>(vk);
+    if (idx >= 256) return false;
+    std::lock_guard<std::mutex> l(m_);
+    return key_down_[idx];
+  }
+
+  // Decay the wheel pulse armed by OnMouseWheel into key_down_, once per game
+  // frame (called from ge_inject_keyboard, not from key_down() itself, which is
+  // polled multiple times per frame and would double-decrement the pulse).
+  void tick_wheel() {
+    std::lock_guard<std::mutex> l(m_);
+    key_down_[static_cast<uint16_t>(rex::ui::VirtualKey::kMouseWheelUp)] = wheel_up_frames_ > 0;
+    key_down_[static_cast<uint16_t>(rex::ui::VirtualKey::kMouseWheelDown)] = wheel_down_frames_ > 0;
+    if (wheel_up_frames_ > 0) --wheel_up_frames_;
+    if (wheel_down_frames_ > 0) --wheel_down_frames_;
+  }
+
+  bool focused() const { return window_ && window_->HasFocus(); }
+  bool suppressed() const { return suppressed_.load(std::memory_order_relaxed); }
+
+  void set_suppressed(bool v) {
+    suppressed_.store(v, std::memory_order_relaxed);
+    if (v) { std::lock_guard<std::mutex> l(m_); dx_ = 0.f; dy_ = 0.f; }  // drop queued motion
+    tick_capture();  // release the cursor immediately when the menu opens
+  }
+
+  // Engage/release capture + recenter. Independent of the FP-mode gate (matches
+  // upstream): keeps the cursor hidden + pinned whenever look is on and focused.
+  void tick_capture() {
+    if (!window_) return;
+    std::lock_guard<std::mutex> cl(cap_m_);
+    const bool want = ge_mouselook_on() && !suppressed_.load(std::memory_order_relaxed) &&
+                      window_->HasFocus();
+    if (want && !captured_) {
+      captured_ = true;
+      window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+      window_->CaptureMouse();
+      std::lock_guard<std::mutex> l(m_);  // no spike on capture start
+      dx_ = 0.f; dy_ = 0.f; have_prev_ = false;
+      raw_motion_ = false;  // re-arm the warp fallback until raw deltas flow again
+    } else if (!want && captured_) {
+      captured_ = false;
+      window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+      window_->ReleaseMouse();
+    }
+    if (captured_) {
+      // Re-center each tick (prevents edge clamping). Seed prev to the center
+      // first so the warp's echoed OnMouseMove yields a zero delta.
+      const int cx = static_cast<int>(window_->GetActualLogicalWidth() / 2);
+      const int cy = static_cast<int>(window_->GetActualLogicalHeight() / 2);
+      { std::lock_guard<std::mutex> l(m_); prev_x_ = cx; prev_y_ = cy; have_prev_ = true; }
+      window_->WarpMouseToClient(cx, cy);
+    }
+  }
+
+  // WindowInputListener
+  void OnMouseMove(rex::ui::MouseEvent& e) override {
+    std::lock_guard<std::mutex> l(m_);
+    if (raw_motion_) return;  // raw XI2 deltas drive look; warped positions are noise
+    const int x = e.x(), y = e.y();
+    if (have_prev_) { dx_ += float(x - prev_x_); dy_ += float(y - prev_y_); }
+    prev_x_ = x; prev_y_ = y; have_prev_ = true;
+  }
+  // Raw unaccelerated deltas (X11 XI2 while captured). Once these flow, the
+  // position-difference path above is skipped: it double-counts the same
+  // motion and re-adds the OS acceleration curve the raw path exists to avoid.
+  void OnMouseRelativeMotion(rex::ui::MouseRelativeEvent& e) override {
+    std::lock_guard<std::mutex> l(m_);
+    raw_motion_ = true;
+    dx_ += e.dx(); dy_ += e.dy();
+  }
+  void OnMouseDown(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), true); }
+  void OnMouseUp(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), false); }
+  void OnKeyDown(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), true); }
+  void OnKeyUp(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), false); }
+  // Wheel notches are edge-only (one callback per detent, no held state at the
+  // window layer -- see rex::ui::WindowInputListener::OnMouseWheel). Arm a short
+  // pulse here; tick_wheel() decays it into key_down_ once per game frame, the
+  // same pattern rexglue's MnkInputDriver uses (mnk_wheel_pulse_frames, default
+  // 2) for its own polled key table.
+  void OnMouseWheel(rex::ui::MouseEvent& e) override {
+    if (REXCVAR_GET(ge_gamestate_diag))
+      REXKRNL_INFO("GEWHEEL event dy={}", e.scroll_y());
+    std::lock_guard<std::mutex> l(m_);
+    constexpr int kPulseFrames = 2;  // matches mnk_wheel_pulse_frames default
+    if (e.scroll_y() > 0) wheel_up_frames_ = kPulseFrames;
+    else if (e.scroll_y() < 0) wheel_down_frames_ = kPulseFrames;
+    if (REXCVAR_GET(ge_gamestate_diag))
+      REXKRNL_INFO("GEWHEEL armed up={} down={}", wheel_up_frames_, wheel_down_frames_);
+  }
+
+  // WindowListener: drop held keys / queued motion on focus loss (no stuck keys
+  // or view snap on alt-tab). Capture itself auto-releases via tick_capture.
+  void OnLostFocus(rex::ui::UISetupEvent&) override {
+    std::lock_guard<std::mutex> l(m_);
+    std::memset(key_down_, 0, sizeof(key_down_));
+    dx_ = 0.f; dy_ = 0.f; have_prev_ = false; raw_motion_ = false;
+    wheel_up_frames_ = 0; wheel_down_frames_ = 0;
+  }
+
+ private:
+  void set_key(rex::ui::VirtualKey vk, bool down) {
+    uint16_t idx = static_cast<uint16_t>(vk);
+    if (idx >= 256) return;
+    std::lock_guard<std::mutex> l(m_);
+    key_down_[idx] = down;
+  }
+  void set_mouse_button(rex::ui::MouseEvent::Button b, bool down) {
+    using B = rex::ui::MouseEvent::Button;
+    rex::ui::VirtualKey vk = rex::ui::VirtualKey::kNone;
+    switch (b) {
+      case B::kLeft: vk = rex::ui::VirtualKey::kLButton; break;
+      case B::kRight: vk = rex::ui::VirtualKey::kRButton; break;
+      case B::kMiddle: vk = rex::ui::VirtualKey::kMButton; break;
+      case B::kX1: vk = rex::ui::VirtualKey::kXButton1; break;
+      case B::kX2: vk = rex::ui::VirtualKey::kXButton2; break;
+      default: return;
+    }
+    set_key(vk, down);
+  }
+
+  mutable std::mutex m_;     // guards dx_/dy_/prev_*/have_prev_/raw_motion_/key_down_
+  std::mutex cap_m_;         // serializes capture transitions (captured_)
+  rex::ui::Window* window_ = nullptr;
+  float dx_ = 0.f, dy_ = 0.f;
+  int prev_x_ = 0, prev_y_ = 0;
+  bool have_prev_ = false;
+  bool raw_motion_ = false;  // XI2 raw deltas flowing -> position diffs are noise
+  bool captured_ = false;
+  std::atomic<bool> suppressed_{false};  // true while the pause menu is open
+  bool key_down_[256] = {};
+  int wheel_up_frames_ = 0, wheel_down_frames_ = 0;  // armed by OnMouseWheel, decayed by tick_wheel()
+};
+
+GameInputListener g_listener;
+std::atomic<bool> g_listener_attached{false};
+
+// Attach the listener to the display window the first time it exists (it may be
+// null at OnCreateDialogs time). Called from InitMouseLook and the per-frame
+// hooks, so attachment is robust regardless of startup ordering.
+void ge_ensure_listener() {
+  if (g_listener_attached.load(std::memory_order_relaxed)) return;
+  rex::Runtime* rt = rex::Runtime::instance();
+  rex::ui::Window* w = rt ? rt->display_window() : nullptr;
+  if (!w) return;
+  bool expected = false;
+  if (g_listener_attached.compare_exchange_strong(expected, true)) {
+    g_listener.Attach(w);
+    REXKRNL_INFO("GEMOUSE listener attached window={}", (void*)w);
+  }
+}
+
+float ge_take_mouse_dx() { return g_listener.take_dx(); }
+float ge_take_mouse_dy() { return g_listener.take_dy(); }
+}  // namespace
+
+namespace ge {
+// Attach the cross-platform mouse/keyboard listener at app startup (or lazily on
+// the first guest frame if the window isn't ready yet).
+void InitMouseLook() {
+  REXKRNL_INFO("GEMOUSE InitMouseLook (enable={})", REXCVAR_GET(ge_mouselook_enable));
+  ge_ensure_listener();
+}
+
+// Called by the app when the pause menu opens/closes so mouse motion isn't
+// turned into look while the player is in menus (the cursor is needed there).
+void SetMouselookSuppressed(bool v) { g_listener.set_suppressed(v); }
+}  // namespace ge
+
+// ===========================================================================
+// Mouse-look: faithful port of the xenia-canary mousehook
+// (src/xenia/hid/winkey/hookables/goldeneye.cc, GoldeneyeGame::DoHooks) for the
+// GoldenEye_Nov2007_Release build. Runs once per frame from ge_inject_keyboard,
+// operating on the local player struct in guest RAM. Writes the game's own
+// camera / crosshair / gun fields incrementally so it coexists with the
+// controller, recoil, and the tank turret.
+// ===========================================================================
+namespace {
+// RareGameBuildAddrs for GoldenEye_Nov2007_Release (from supported_builds[]).
+constexpr uint32_t GE_MENU_XY       = 0x8272B37Cu;  // menu cursor X (Y at +4)
+constexpr uint32_t GE_PAUSE_FLAG    = 0x82F1E70Cu;  // non-zero ~= game paused
+constexpr uint32_t GE_SETTINGS_PTR  = 0x83088228u;  // -> settings struct pointer
+constexpr uint32_t GE_SETTINGS_BITS = 0x298u;       // bitflags offset in struct
+constexpr uint32_t GE_PLAYER_PTR    = 0x82F1FA98u;  // -> players[0] (host's Bond)
+constexpr uint32_t GE_BONDVIEW_CUR  = 0x82F1FAACu;  // -> currently-controlled view's player
+constexpr uint32_t GE_OFF_WATCH     = 0x2E8u;       // watch status (!=0 -> input disabled)
+constexpr uint32_t GE_OFF_DISABLED  = 0x80u;        // control-disabled flag (cutscene)
+constexpr uint32_t GE_OFF_CAM_X     = 0x254u;       // camera yaw
+constexpr uint32_t GE_OFF_CAM_Y     = 0x264u;       // camera pitch
+constexpr uint32_t GE_OFF_CH_X      = 0x10A8u;      // crosshair X
+constexpr uint32_t GE_OFF_CH_Y      = 0x10ACu;      // crosshair Y
+constexpr uint32_t GE_OFF_GUN_X     = 0x10BCu;      // gun X
+constexpr uint32_t GE_OFF_GUN_Y     = 0x10C0u;      // gun Y
+constexpr uint32_t GE_OFF_AIM_MODE  = 0x22Cu;       // aim-mode (1 = aiming)
+constexpr uint32_t GE_OFF_AIM_MULT  = 0x11ACu;      // aim-turn multiplier (slows when zoomed)
+enum GESettingFlag {
+  GE_SET_AutoAim   = 0x10,
+  GE_SET_LookAhead = 0x80,
+};
+}  // namespace
+
+void ge_mouse_camera(uint8_t* base) {
+  // Persistent state (= GoldeneyeGame member vars in xenia).
+  static uint32_t prev_pause = 0, prev_disabled = 0, prev_aim_mode = 0;
+  static bool start_centering = false, disable_sway = false;
+  static float centering_speed = 0.0125f;
+
+  const float sensitivity = static_cast<float>(REXCVAR_GET(ge_mouse_sens));
+  const float menu_sensitivity = static_cast<float>(REXCVAR_GET(ge_menu_sensitivity));
+  const bool invert_x = REXCVAR_GET(ge_invert_x);
+  const bool invert_y = REXCVAR_GET(ge_invert_y);
+  const bool disable_autoaim = REXCVAR_GET(ge_disable_autoaim);
+  const float aim_turn_distance = static_cast<float>(REXCVAR_GET(ge_aim_turn_distance));
+  const bool gun_sway = REXCVAR_GET(ge_gun_sway);
+
+  // Consume this frame's raw mouse delta once; used for both menu and camera.
+  const float mdx = ge_take_mouse_dx();
+  const float mdy = ge_take_mouse_dy();
+
+  // Optional look smoothing: EMA over the per-frame delta so frame-pacing
+  // jitter doesn't turn 1:1 into uneven yaw steps. Camera/crosshair only --
+  // the menu cursor below stays raw (a laggy cursor feels broken). The tail
+  // snaps to zero once imperceptible so the camera fully stops.
+  static float smooth_dx = 0.f, smooth_dy = 0.f;
+  const float smooth = static_cast<float>(REXCVAR_GET(ge_mouse_smooth));
+  float cdx = mdx, cdy = mdy;
+  if (smooth > 0.f) {
+    smooth_dx = smooth_dx * smooth + mdx * (1.f - smooth);
+    smooth_dy = smooth_dy * smooth + mdy * (1.f - smooth);
+    if (mdx == 0.f && std::fabs(smooth_dx) < 0.01f) smooth_dx = 0.f;
+    if (mdy == 0.f && std::fabs(smooth_dy) < 0.01f) smooth_dy = 0.f;
+    cdx = smooth_dx; cdy = smooth_dy;
+  } else {
+    smooth_dx = smooth_dy = 0.f;  // don't carry a stale tail into a re-enable
+  }
+
+  // Move the menu selection crosshair (the game's own menus read these).
+  {
+    float menuX = LDF32(base, GE_MENU_XY);
+    float menuY = LDF32(base, GE_MENU_XY + 4);
+    menuX += (mdx / 5.f) * menu_sensitivity;
+    menuY += (mdy / 5.f) * menu_sensitivity;
+    STF32(base, GE_MENU_XY, menuX);
+    STF32(base, GE_MENU_XY + 4, menuY);
+  }
+
+  // Target the LOCAL player. Online uses Xbox System Link, where each console
+  // controls its OWN Bond at a session-global index (host = players[0], clients =
+  // players[1..3]). players[0] (GE_PLAYER_PTR) is therefore only the local player
+  // on the host -- using it made mouse-look host-only. GE_BONDVIEW_CUR points at
+  // the view the local console is actually driving, so it resolves to this
+  // console's player in online play and to players[0] in single-player/the host.
+  // Target the LOCAL player = the active-viewport player. player+0x904 (viewport
+  // size/offset) is 0 only for the view the local console actually renders -- the
+  // same signal GoldenEye's own code uses ("current player is the active
+  // viewport", per the CE 3D-SFX hack). This is stable every frame and resolves
+  // to players[0] on the host, players[1] on a joiner, etc., automatically.
+  // (The old GE_BONDVIEW_CUR target flipped between local/remote each frame
+  // because the bondview CONTROL loop cycles it across all players -- that was
+  // the online jitter.)
+  uint32_t player = 0;
+  for (int i = 0; i < 4; ++i) {
+    uint32_t p = LD32(base, 0x82F1FA98u + i * 4u);
+    if (p && LD32(base, p + 0x904u) == 0u) { player = p; break; }
+  }
+  if (!player) player = LD32(base, GE_BONDVIEW_CUR);  // fallback (menus/boot)
+  if (!player) player = LD32(base, GE_PLAYER_PTR);
+  if (!player) return;
+
+  const uint32_t game_pause_flag = LD32(base, GE_PAUSE_FLAG);
+
+  // control-disabled (cutscene); fall back to watch-status (watch up/down).
+  uint32_t game_control_disabled = LD32(base, player + GE_OFF_DISABLED);
+  if (game_control_disabled == 0)
+    game_control_disabled = LD32(base, player + GE_OFF_WATCH);
+
+  // Disable auto-aim & look-ahead, only when the pause/control state changes --
+  // xenia's exact behaviour. (Doing it every frame oscillated against the game's
+  // per-frame auto-aim in multiplayer and caused the camera jitter.)
+  if (game_pause_flag != prev_pause || game_control_disabled != prev_disabled) {
+    const uint32_t sp = LD32(base, GE_SETTINGS_PTR);
+    if (sp) {
+      const uint32_t sva = sp + GE_SETTINGS_BITS;
+      uint32_t settings = LD32(base, sva);
+      if (settings & GE_SET_LookAhead) settings &= ~(uint32_t)GE_SET_LookAhead;
+      if (disable_autoaim && (settings & GE_SET_AutoAim))
+        settings &= ~(uint32_t)GE_SET_AutoAim;
+      ST32(base, sva, settings);
+    }
+    prev_pause = game_pause_flag;
+    prev_disabled = game_control_disabled;
+  }
+
+  if (game_control_disabled) return;
+
+  const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
+  if (aim_mode != prev_aim_mode) {
+    if (aim_mode != 0) {  // entering aim mode -> reset gun position
+      STF32(base, player + GE_OFF_GUN_X, 0.f);
+      STF32(base, player + GE_OFF_GUN_Y, 0.f);
+    }
+    // Always reset crosshair on enter/exit (else non-aim fires toward it).
+    STF32(base, player + GE_OFF_CH_X, 0.f);
+    STF32(base, player + GE_OFF_CH_Y, 0.f);
+    prev_aim_mode = aim_mode;
+  }
+
+  const float bounds = 1.f, dividor = 500.f, gun_multiplier = 1.f;
+  const float crosshair_multiplier = 1.f, centering_multiplier = 1.f;
+  const float aim_turn_dividor = 1.f;
+
+  if (aim_mode == 1) {
+    float chX = LDF32(base, player + GE_OFF_CH_X);
+    float chY = LDF32(base, player + GE_OFF_CH_Y);
+    chX += (invert_x ? -1.f : 1.f) * (cdx / dividor) * sensitivity;
+    chY += (invert_y ? -1.f : 1.f) * (cdy / dividor) * sensitivity;
+
+    chX = std::min(chX, bounds); chX = std::max(chX, -bounds);
+    chY = std::min(chY, bounds); chY = std::max(chY, -bounds);
+
+    STF32(base, player + GE_OFF_CH_X, chX);
+    STF32(base, player + GE_OFF_CH_Y, chY);
+    STF32(base, player + GE_OFF_GUN_X, chX * gun_multiplier);
+    STF32(base, player + GE_OFF_GUN_Y, chY * gun_multiplier);
+
+    // Turn the camera once the crosshair travels past a threshold.
+    float camX = LDF32(base, player + GE_OFF_CAM_X);
+    float camY = LDF32(base, player + GE_OFF_CAM_Y);
+    const float aim_multiplier = LDF32(base, player + GE_OFF_AIM_MULT);
+    const float ch_distance = sqrtf(chX * chX + chY * chY);
+    if (ch_distance > aim_turn_distance) {
+      camX += (chX / aim_turn_dividor) * aim_multiplier;
+      STF32(base, player + GE_OFF_CAM_X, camX);
+      camY -= (chY / aim_turn_dividor) * aim_multiplier;
+      STF32(base, player + GE_OFF_CAM_Y, camY);
+    }
+
+    start_centering = true;
+    disable_sway = true;       // skip weapon sway until we've centered
+    centering_speed = 0.05f;   // speed up centering when leaving aim-mode
+  } else {
+    float gX = LDF32(base, player + GE_OFF_GUN_X);
+    float gY = LDF32(base, player + GE_OFF_GUN_Y);
+
+    // Gun-centering back to the middle after aim-mode / when idle.
+    if (start_centering) {
+      if (gX != 0 || gY != 0) {
+        if (gX > 0) gX -= std::min(centering_speed * centering_multiplier, gX);
+        if (gX < 0) gX += std::min(centering_speed * centering_multiplier, -gX);
+        if (gY > 0) gY -= std::min(centering_speed * centering_multiplier, gY);
+        if (gY < 0) gY += std::min(centering_speed * centering_multiplier, -gY);
+      }
+      if (gX == 0 && gY == 0) {
+        centering_speed = 0.0125f;
+        start_centering = false;
+        disable_sway = false;
+      }
+    }
+
+    if (cdx != 0.f || cdy != 0.f) {
+      float camX = LDF32(base, player + GE_OFF_CAM_X);
+      float camY = LDF32(base, player + GE_OFF_CAM_Y);
+
+      camX += (invert_x ? -1.f : 1.f) * (cdx / 10.f) * sensitivity;
+
+      // Add 'sway' to the gun as the camera turns.
+      const float gun_sway_x = ((cdx / 16000.f) * sensitivity) * bounds;
+      const float gun_sway_y = ((cdy / 16000.f) * sensitivity) * bounds;
+      float gun_sway_x_changed = gX + gun_sway_x;
+      float gun_sway_y_changed = gY + gun_sway_y;
+
+      if (!invert_y) {
+        camY -= (cdy / 10.f) * sensitivity;
+      } else {
+        camY += (cdy / 10.f) * sensitivity;
+        gun_sway_y_changed = gY - gun_sway_y;
+      }
+
+      STF32(base, player + GE_OFF_CAM_X, camX);
+      STF32(base, player + GE_OFF_CAM_Y, camY);
+
+      if (gun_sway && !disable_sway) {
+        // Bound the sway to [0.2:-0.2] (only if it would push further OOB).
+        if (gun_sway_x_changed > (0.2f * bounds) && gun_sway_x > 0) gun_sway_x_changed = gX;
+        if (gun_sway_x_changed < -(0.2f * bounds) && gun_sway_x < 0) gun_sway_x_changed = gX;
+        if (gun_sway_y_changed > (0.2f * bounds) && gun_sway_y > 0) gun_sway_y_changed = gY;
+        if (gun_sway_y_changed < -(0.2f * bounds) && gun_sway_y < 0) gun_sway_y_changed = gY;
+        gX = gun_sway_x_changed;
+        gY = gun_sway_y_changed;
+      }
+    } else {
+      if (!start_centering) {
+        start_centering = true;
+        centering_speed = 0.0125f;
+      }
+    }
+
+    gX = std::min(gX, bounds); gX = std::max(gX, -bounds);
+    gY = std::min(gY, bounds); gY = std::max(gY, -bounds);
+
+    STF32(base, player + GE_OFF_CH_X, gX * crosshair_multiplier);
+    STF32(base, player + GE_OFF_CH_Y, gY * crosshair_multiplier);
+    STF32(base, player + GE_OFF_GUN_X, gX);
+    STF32(base, player + GE_OFF_GUN_Y, gY);
+  }
+}
+
+// ===========================================================================
+// Keyboard buttons -> guest gamepad. The right stick (look) is the mouse; every
+// other controller input is mapped to a rebindable keyboard key here, injected
+// into the polled gamepad buffer so it works alongside a real pad. We do this
+// ourselves (not via the SDK's MnK driver) so it can't fight the mouse capture.
+//
+// Slot-0 gamepad buffer (filled by XamInputGetState in ge_input_poll_controllers,
+// Xbox360 big-endian): +0 buttons(u16), +2 LT, +3 RT, +4 LX(s16), +6 LY(s16).
+// ===========================================================================
+namespace {
+constexpr uint32_t GE_PAD0 = 0x830C8B9Cu;  // unk_830C8B9C, slot-0 gamepad
+
+// XInput button bits (match the masks the guest unpacks).
+constexpr uint16_t BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT = 0x0004,
+                   BTN_DPAD_RIGHT = 0x0008, BTN_START = 0x0010, BTN_BACK = 0x0020,
+                   BTN_LTHUMB = 0x0040, BTN_RTHUMB = 0x0080, BTN_LSHOULDER = 0x0100,
+                   BTN_RSHOULDER = 0x0200, BTN_A = 0x1000, BTN_B = 0x2000, BTN_X = 0x4000,
+                   BTN_Y = 0x8000;
+
+bool ge_input_active() {  // keyboard counts only when focused + not in the menu
+  return !g_listener.suppressed() && g_listener.focused();
+}
+
+// Is the key currently bound to cvar `name` held down? Reads the bind by name,
+// parses it to a virtual key, and polls the cross-platform key-down table.
+bool ge_key_down(const char* name) {
+  std::string keyname = rex::cvar::GetFlagByName(name);
+  if (keyname.empty()) return false;
+  rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(keyname);
+  if (vk == rex::ui::VirtualKey::kNone) return false;
+  return g_listener.key_down(vk);
+}
+}  // namespace
+
+// Keyboard binds. Defaults are a placeholder layout; rebindable in the menu.
+REXCVAR_DEFINE_BOOL(ge_keyboard_enable, true, "Input", "Map keyboard keys to controller buttons");
+REXCVAR_DEFINE_STRING(ge_key_mv_up, "W", "Input/Keybinds", "Move forward (left stick up)");
+REXCVAR_DEFINE_STRING(ge_key_mv_down, "S", "Input/Keybinds", "Move back (left stick down)");
+REXCVAR_DEFINE_STRING(ge_key_mv_left, "A", "Input/Keybinds", "Move left (left stick left)");
+REXCVAR_DEFINE_STRING(ge_key_mv_right, "D", "Input/Keybinds", "Move right (left stick right)");
+REXCVAR_DEFINE_STRING(ge_key_a, "Space", "Input/Keybinds", "A button");
+REXCVAR_DEFINE_STRING(ge_key_b, "Control", "Input/Keybinds", "B button");
+REXCVAR_DEFINE_STRING(ge_key_x, "R", "Input/Keybinds", "X button");
+REXCVAR_DEFINE_STRING(ge_key_y, "E", "Input/Keybinds", "Y button");
+REXCVAR_DEFINE_STRING(ge_key_lt, "RMB", "Input/Keybinds", "Left trigger");
+REXCVAR_DEFINE_STRING(ge_key_rt, "LMB", "Input/Keybinds", "Right trigger");
+REXCVAR_DEFINE_STRING(ge_key_lb, "Q", "Input/Keybinds", "Left shoulder");
+REXCVAR_DEFINE_STRING(ge_key_rb, "F", "Input/Keybinds", "Right shoulder");
+REXCVAR_DEFINE_STRING(ge_key_l3, "C", "Input/Keybinds", "Left stick press");
+REXCVAR_DEFINE_STRING(ge_key_r3, "V", "Input/Keybinds", "Right stick press");
+REXCVAR_DEFINE_STRING(ge_key_dup, "Up", "Input/Keybinds", "D-pad up");
+REXCVAR_DEFINE_STRING(ge_key_ddown, "Down", "Input/Keybinds", "D-pad down");
+REXCVAR_DEFINE_STRING(ge_key_dleft, "Left", "Input/Keybinds", "D-pad left");
+REXCVAR_DEFINE_STRING(ge_key_dright, "Right", "Input/Keybinds", "D-pad right");
+REXCVAR_DEFINE_STRING(ge_key_start, "Return", "Input/Keybinds", "Start button");
+REXCVAR_DEFINE_STRING(ge_key_back, "Tab", "Input/Keybinds", "Back button");
+REXCVAR_DEFINE_BOOL(ge_weapon_select_enable, true, "Input",
+                    "Number keys 1-9 / scrollwheel select carried weapons");
+REXCVAR_DEFINE_BOOL(ge_weapon_direct_switch, true, "Input",
+                    "Switch weapons via a direct game call (off = Y-cycle walk)");
+REXCVAR_DEFINE_STRING(ge_key_wpn_next, "WheelUp", "Input/Keybinds", "Next carried weapon");
+REXCVAR_DEFINE_STRING(ge_key_wpn_prev, "WheelDown", "Input/Keybinds", "Previous carried weapon");
+
+// On-screen touch controls (ordinary Android phones/tablets). The virtual pad is
+// drawn + hit-tested by the Java overlay (TouchControlsView); these cvars are its
+// policy/tuning knobs, read back over JNI. The synthesized pad frame is injected
+// into the guest below via ge::TouchPad (ge_touchpad.h).
+//   ge_touch_controls : auto = show only when no gamepad is connected (default),
+//                       on = always show, off = never show.
+//   ge_touch_look_mode: swipe = drag the right half to look (default), stick =
+//                       fixed right thumbstick.
+REXCVAR_DEFINE_STRING(ge_touch_controls, "auto", "Input",
+                      "On-screen touch controls: auto|on|off");
+REXCVAR_DEFINE_STRING(ge_touch_look_mode, "stick", "Input",
+                      "Touch look control: stick|swipe");
+REXCVAR_DEFINE_DOUBLE(ge_touch_look_sens, 1.0, "Input",
+                      "Touch look sensitivity").range(0.1, 8.0);
+REXCVAR_DEFINE_DOUBLE(ge_touch_opacity, 0.5, "Input",
+                      "Touch controls opacity (0..1)").range(0.1, 1.0);
+
+// Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
+// and before the guest dispatches it. OR our keyboard buttons in, and set the
+// left stick / triggers when their keys are held (pad input is preserved).
+void ge_mouse_camera(uint8_t* base);  // defined above
+void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
+// Phase-2 verification harness (defined below, next to the discovery hook, so
+// it can share dbg_safe_ld32). See docs/HANDOFF-weapon-switch-direct-call.md.
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id);
+
+// Hoisted up from the BeanTools CE MP hooks section below (this file's usual
+// spot for it) because the direct-switch driver, earlier in the file, also
+// needs it -- anonymous-namespace symbols are only visible from their point of
+// declaration onward, and duplicating the constant in two anonymous
+// namespaces would make it ambiguous at the later (CE hooks) use sites.
+namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
+
+void ge_inject_keyboard(PPCRegister& /*r11*/) {
+  // Attach the input listener from the controller-poll path too. InitMouseLook()
+  // runs at OnCreateDialogs when Runtime::display_window() can still be null, so
+  // without this the listener never attaches while in menus and keyboard/mouse
+  // stay dead until a level loads. This poll runs every frame (incl. menus), so
+  // it attaches early. NB: the keyboard early-return moved BELOW the CE/mouse
+  // block so data fixes + mouse-look still run when only the keyboard is off.
+  ge_ensure_listener();
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+
+  // Apply BeanTools community DATA bug-fixes once, before any level loads its
+  // setup/fog/BG data. The data segment is live in guest RAM by the first input
+  // poll (menu), which precedes any level load.
   static bool ce_patched = false;
-  if (ce_patched) return;
-  ce_patched = true;
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
-  ge_apply_ce_data_patches(base);
-  REXKRNL_INFO("GECE community data bug-fixes applied");
+  if (!ce_patched) {
+    ce_patched = true;
+    ge_apply_ce_data_patches(base);
+    REXKRNL_INFO("GECE community data bug-fixes applied");
+  }
+
+  // Mouse look runs every frame here, independent of the keyboard toggle. The
+  // cross-platform listener only accumulates deltas while the game is focused and
+  // the cursor is captured, so this is a no-op in menus / when unfocused.
+  // tick_capture() drives the per-frame capture/recenter lifecycle (it used to
+  // live in the now-removed ge_mouselook_pitch hook; ge_ensure_listener already
+  // ran at the top of this function).
+  g_listener.tick_capture();
+  // Decay any wheel pulse armed by OnMouseWheel into key_down_ this frame (see
+  // GameInputListener::tick_wheel()) -- must run once per frame, same cadence
+  // the weapon-select block below polls kMouseWheelUp/Down at.
+  g_listener.tick_wheel();
+  if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
+
+  // Phase-2 verification harness: an `equip <id>` posted from the memscan
+  // command channel fires ONE direct switch, bypassing RequestEquipWeapon, so
+  // the guest call can be exercised and observed in isolation. Diag-only.
+  if (REXCVAR_GET(ge_gamestate_diag)) {
+    const int32_t direct = ge::gamestate::TakeDirectEquip();
+    if (direct != ge::gamestate::kNoWeapon) {
+      if (ge::gamestate::GetWeaponSnapshot().valid) {
+        ge_direct_equip(ctx, base, direct);
+      } else {
+        REXKRNL_INFO("GEWPN equip harness: no live player snapshot, dropped");
+      }
+    }
+  }
+
+  // Weapon actuation: move the game to the pending target posted via
+  // RequestEquipWeapon. Preferred mechanism: direct calls into the game's own
+  // switch routine (instant; see ge_direct_equip -- both hands, dual-aware).
+  // The entry silently drops requests while the player is mid-action (e.g.
+  // firing), so the driver re-issues every kDirectConfirm frames until the
+  // switch lands or kMaxDirectTries expire. The pre-discovery Y-cycle walker
+  // is kept intact behind ge_weapon_direct_switch=false as the escape hatch.
+  {
+    constexpr int kMaxSteps = 16;       // Y-cycle: total presses before giving up
+    constexpr int kStepTimeout = 90;    // Y-cycle: frames for one switch to land
+    constexpr int kDirectConfirm = 30;  // direct: frames between (re)issues
+    constexpr int kMaxDirectTries = 10; // direct: re-issues before giving up
+    static int steps = 0, wait = 0;
+    static bool pressed = false;
+    static int32_t equipped_at_press = 0;
+    static int32_t last_target = ge::gamestate::kNoWeapon;
+    static int direct_tries = 0, direct_wait = 0;
+    const int32_t target = ge::gamestate::PeekEquipRequest();
+    if (target == ge::gamestate::kNoWeapon) {
+      steps = 0; wait = 0; pressed = false;
+      direct_tries = 0; direct_wait = 0;
+      last_target = ge::gamestate::kNoWeapon;
+    } else {
+      if (target != last_target) {
+        // New target posted mid-flight: restart both mechanisms toward it.
+        steps = 0; wait = 0; pressed = false;
+        direct_tries = 0; direct_wait = 0;
+        last_target = target;
+      }
+      const auto snap = ge::gamestate::GetWeaponSnapshot();
+      const bool held = target >= 0 && target < ge::gamestate::kMaxWeaponSlots &&
+                        (snap.held_mask & (1u << target)) != 0;
+      if (!snap.valid || !held || snap.equipped_id == target) {
+        // Done, or guarded out (no live inventory / unheld id) -- drop the request.
+        ge::gamestate::ClearEquipRequest();
+        steps = 0; wait = 0; pressed = false;
+        direct_tries = 0; direct_wait = 0;
+        last_target = ge::gamestate::kNoWeapon;
+      } else if (REXCVAR_GET(ge_weapon_direct_switch) && base[GE_NET_FLAG] == 0) {
+        // Direct calls act on GE_BONDVIEW_CUR-derived state, which cycles across
+        // players in MP -- route MP sessions to the pad-injection walker below
+        // (player-0-safe by construction). Local splitscreen is NOT covered by
+        // this flag; see the handoff's known limitations.
+        if (direct_wait > 0) {
+          --direct_wait;  // waiting for the last issue to land
+        } else if (direct_tries >= kMaxDirectTries) {
+          REXKRNL_INFO("GEWPN direct switch gave up after {} tries (target={})",
+                       direct_tries, target);
+          ge::gamestate::ClearEquipRequest();
+          direct_tries = 0; direct_wait = 0;
+          last_target = ge::gamestate::kNoWeapon;
+        } else {
+          ge_direct_equip(ctx, base, target);  // dedups guest-side; re-issue is safe
+          ++direct_tries; direct_wait = kDirectConfirm;
+        }
+      } else if (steps >= kMaxSteps) {
+        ge::gamestate::ClearEquipRequest();
+        steps = 0; wait = 0; pressed = false;
+        last_target = ge::gamestate::kNoWeapon;
+      } else if (pressed && snap.equipped_id == equipped_at_press && wait < kStepTimeout) {
+        ++wait;  // Y-cycle: previous switch still in flight
+      } else {
+        // Y-cycle: first press, or the previous switch landed / timed out.
+        ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_Y);
+        equipped_at_press = snap.equipped_id;
+        pressed = true; ++steps; wait = 0;
+      }
+    }
+  }
+
+  // On-screen touch controls: OR the Java overlay's synthesized pad frame into
+  // the guest slot-0 buffer. Independent of ge_keyboard_enable / focus (a phone
+  // has no keyboard and the overlay owns its own touches), so it runs before the
+  // keyboard gate below. Only writes fields that are actually actuated, so it
+  // never zeroes a real pad's input (the overlay is hidden when a pad is present
+  // anyway -- see the auto policy in GoldenEyeActivity). No-op on desktop, where
+  // TouchPad stays at its zeroed default.
+  if (ge::TouchPad::Get().Active()) {
+    const ge::PadState tp = ge::TouchPad::Get().GetState();
+    if (tp.buttons)
+      ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | tp.buttons);
+    if (tp.left_trigger) base[GE_PAD0 + 2] = tp.left_trigger;
+    if (tp.right_trigger) base[GE_PAD0 + 3] = tp.right_trigger;
+    if (tp.thumb_lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(tp.thumb_lx));
+    if (tp.thumb_ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(tp.thumb_ly));
+    if (tp.thumb_rx) ST16(base, GE_PAD0 + 8, static_cast<uint16_t>(tp.thumb_rx));
+    if (tp.thumb_ry) ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(tp.thumb_ry));
+  }
+
+  if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
+
+  uint16_t add = 0;
+  if (ge_key_down("ge_key_a")) add |= BTN_A;
+  if (ge_key_down("ge_key_b")) add |= BTN_B;
+  if (ge_key_down("ge_key_x")) add |= BTN_X;
+  if (ge_key_down("ge_key_y")) add |= BTN_Y;
+  if (ge_key_down("ge_key_lb")) add |= BTN_LSHOULDER;
+  if (ge_key_down("ge_key_rb")) add |= BTN_RSHOULDER;
+  if (ge_key_down("ge_key_l3")) add |= BTN_LTHUMB;
+  if (ge_key_down("ge_key_r3")) add |= BTN_RTHUMB;
+  if (ge_key_down("ge_key_dup")) add |= BTN_DPAD_UP;
+  if (ge_key_down("ge_key_ddown")) add |= BTN_DPAD_DOWN;
+  if (ge_key_down("ge_key_dleft")) add |= BTN_DPAD_LEFT;
+  if (ge_key_down("ge_key_dright")) add |= BTN_DPAD_RIGHT;
+  if (ge_key_down("ge_key_start")) add |= BTN_START;
+  if (ge_key_down("ge_key_back")) add |= BTN_BACK;
+  if (add) ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | add);
+
+  if (ge_key_down("ge_key_lt")) base[GE_PAD0 + 2] = 0xFF;
+  if (ge_key_down("ge_key_rt")) base[GE_PAD0 + 3] = 0xFF;
+
+  int16_t lx = 0, ly = 0;
+  if (ge_key_down("ge_key_mv_left")) lx = -32767;
+  if (ge_key_down("ge_key_mv_right")) lx = 32767;
+  if (ge_key_down("ge_key_mv_up")) ly = 32767;
+  if (ge_key_down("ge_key_mv_down")) ly = -32767;
+  if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
+  if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
+
+  // Weapon selection: digits 1-9 jump straight to the Nth carried weapon, and
+  // the scrollwheel steps next/prev through the carried list. Edge-triggered so
+  // a held key posts exactly one request. Actuation happens in the driver
+  // above (which walks or direct-calls the game to the target), so this block
+  // only ever posts RequestEquipWeapon.
+  if (REXCVAR_GET(ge_weapon_select_enable)) {
+    static rex::ui::VirtualKey digit_vk[9] = {};
+    static bool vk_init = false;
+    if (!vk_init) {
+      vk_init = true;
+      const char* names[9] = {"1", "2", "3", "4", "5", "6", "7", "8", "9"};
+      for (int i = 0; i < 9; ++i) digit_vk[i] = rex::ui::ParseVirtualKey(names[i]);
+    }
+    static uint16_t prev_digits = 0;
+    static bool prev_next = false, prev_prev = false;
+    const auto snap = ge::gamestate::GetWeaponSnapshot();
+    if (snap.valid && snap.held_count > 0) {
+      uint16_t digits = 0;
+      for (int i = 0; i < 9; ++i)
+        if (g_listener.key_down(digit_vk[i])) digits |= (uint16_t)(1u << i);
+      for (int i = 0; i < 9 && i < snap.held_count; ++i)
+        if ((digits & (1u << i)) && !(prev_digits & (1u << i)))
+          ge::gamestate::RequestEquipWeapon(snap.held_ids[i]);
+      prev_digits = digits;
+
+      const bool next = ge_key_down("ge_key_wpn_next");
+      const bool prev = ge_key_down("ge_key_wpn_prev");
+      if ((next || prev) && REXCVAR_GET(ge_gamestate_diag))
+        REXKRNL_INFO("GEWHEEL keydown next={} prev={}", next, prev);
+      if ((next && !prev_next) || (prev && !prev_prev)) {
+        int idx = 0;
+        for (int i = 0; i < snap.held_count; ++i)
+          if (snap.held_ids[i] == snap.equipped_id) { idx = i; break; }
+        const int step = (next && !prev_next) ? 1 : -1;
+        const int n = (idx + step + snap.held_count) % snap.held_count;
+        ge::gamestate::RequestEquipWeapon(snap.held_ids[n]);
+      }
+      prev_next = next; prev_prev = prev;
+    } else {
+      prev_digits = 0; prev_next = false; prev_prev = false;
+    }
+  }
+}
+
+namespace {
+// Fault-safe guest read for the diag hook below. The recomp's guard/unmapped
+// pages make a raw LD32 of a stray guest pointer retry its SIGSEGV forever
+// (total freeze -- hit live when the applier was called with a garbage r4
+// during level load). pread on /proc/self/mem fails gracefully instead; same
+// pattern as memscan::rd() in ge_gamestate.cpp. Returns 0xffffffff sentinel
+// when unreadable.
+uint32_t dbg_safe_ld32(uint8_t* base, uint32_t ga) {
+#if defined(__linux__)
+  static int fd = -1;
+  if (fd < 0) {
+    fd = ::open("/proc/self/mem", O_RDONLY);
+    static bool warned = false;
+    if (fd < 0 && !warned) {
+      warned = true;
+      REXKRNL_WARN("GEWPN dbg_safe_ld32: /proc/self/mem open failed; guest reads degrade to sentinel (dual detection disabled)");
+    }
+  }
+  uint8_t b[4] = {0};
+  if (fd < 0 || pread(fd, b, 4, (off_t)((uintptr_t)base + ga)) < 4) return 0xffffffffu;
+  return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+         ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+#else
+  (void)base; (void)ga;
+  return 0xffffffffu;
+#endif
+}
+
+// Dual-item inventory walk (task-3-analysis-round2.md "Host recipe" / Q1 & Q4):
+// `g = load_be32(GE_BONDVIEW_CUR)` (0x82F1FAAC, the player-hands struct
+// pointer already used elsewhere in this file) heads a circular linked list
+// of carried-item records at `*(g+4744)`. Each node is
+// `{u32 type @+0, u32 idA @+4, u32 idB @+8, u32 next @+12}`; `type==3` is a
+// dual-item record `{3, idA, idB}` (a same-weapon dual, e.g. dual Phantoms,
+// is `{3, 0x0c, 0x0c}`). Returns true and writes the *other* id in the node
+// through `partner_out` iff a dual record containing `weapon_id` is found.
+//
+// Every read goes through dbg_safe_ld32 (fault-safe: returns the 0xffffffff
+// sentinel instead of retrying a SIGSEGV forever) and every pointer is
+// bounds-checked before it is dereferenced, mirroring
+// ge_gamestate.cpp's plausible_guest_ptr idiom -- any sentinel/implausible
+// read anywhere in the walk aborts it and reports "not dual" rather than
+// risk a fault loop. kMaxDualWalk bounds the node count as a second guard
+// against a corrupt/cyclic list that never re-hits `head`.
+constexpr int kMaxDualWalk = 64;
+inline bool ge_plausible_guest_ptr(uint32_t ga) {
+  return ga >= 0x00010000u && ga < 0xFFFF0000u;
+}
+bool ge_find_dual_partner(uint8_t* base, int32_t weapon_id, int32_t* partner_out) {
+  const uint32_t g = dbg_safe_ld32(base, GE_BONDVIEW_CUR);
+  if (g == 0xffffffffu || !ge_plausible_guest_ptr(g)) return false;
+  const uint32_t head = dbg_safe_ld32(base, g + 4744u);
+  if (head == 0xffffffffu || head == 0u || !ge_plausible_guest_ptr(head)) return false;
+  uint32_t node = head;
+  for (int i = 0; i < kMaxDualWalk; ++i) {
+    const uint32_t type = dbg_safe_ld32(base, node + 0u);
+    const uint32_t idA  = dbg_safe_ld32(base, node + 4u);
+    const uint32_t idB  = dbg_safe_ld32(base, node + 8u);
+    const uint32_t next = dbg_safe_ld32(base, node + 12u);
+    if (type == 0xffffffffu || idA == 0xffffffffu || idB == 0xffffffffu ||
+        next == 0xffffffffu) {
+      return false;  // fault mid-walk -- never trust a torn read
+    }
+    if (type == 3u && (static_cast<int32_t>(idA) == weapon_id ||
+                        static_cast<int32_t>(idB) == weapon_id)) {
+      *partner_out = static_cast<int32_t>(
+          static_cast<int32_t>(idA) == weapon_id ? idB : idA);
+      return true;
+    }
+    if (next == 0u || next == head) break;       // list end / one full loop
+    if (!ge_plausible_guest_ptr(next)) break;     // implausible next -- stop
+    node = next;
+  }
+  return false;
+}
+}  // namespace
+
+// ===========================================================================
+// Phase-1 discovery hook (weapon direct-switch RE; spec:
+// docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md). Entry of
+// sub_820A7508, the per-hand weapon applier -- the known bottom of the switch
+// call chain. Logs the guest caller (lr) and args so a pause-menu inventory
+// selection can be diffed against a Y-cycle switch: the first lr unique to
+// the pause-menu path identifies the direct-switch caller. Inert unless
+// ge_gamestate_diag is set (desktop RE sessions only).
+// ===========================================================================
+void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
+  if (!REXCVAR_GET(ge_gamestate_diag)) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const uint32_t obj = r4.u32;
+  uint32_t w[4] = {0, 0, 0, 0};
+  if (obj) for (int i = 0; i < 4; ++i) w[i] = dbg_safe_ld32(base, obj + 4u * i);
+  // 0x447f10b0 = equipped-id block (kEquipIdAddr in ge_gamestate.cpp); reads
+  // are fault-safe (dbg_safe_ld32) -- the applier can be called with a
+  // garbage r4 during level load, so "guaranteed live" was a false assumption
+  // that caused a total freeze (raw LD32 retrying a SIGSEGV forever).
+  REXKRNL_INFO("GEWPNAPPLY lr={:#010x} hand={} obj={:#010x} "
+               "obj[0..3]={:#010x},{:#010x},{:#010x},{:#010x} equip={}",
+               (uint32_t)ctx->lr, r3.u32, obj, w[0], w[1], w[2], w[3],
+               (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+}
+
+// ===========================================================================
+// Phase-2 verification harness: direct weapon switch -- the verified
+// two-hand pair-call recipe (task-3-analysis-round2.md "Host recipe"). The
+// native Y-cycle helpers never issue a lone hand-0 or hand-1 request; they
+// always request BOTH hands together in the same quantum (sub_820A6F70(0,...)
+// immediately followed by sub_820A6F70(1,...)), which is what arms hand 1's
+// state-5 bypass before hand 0's own swap point can force-clobber it (round-2
+// Q1's "ordering/clobber caveat"). This function reproduces that pairing:
+//   - Single switch: hand 0 <- weapon_id, hand 1 <- 0 (id 0 is an explicit
+//     off-hand clear -- sub_820C0D48's "b==0" rule always passes it), so a
+//     single-weapon switch also clears any stale off-hand weapon.
+//   - Dual grant: if the inventory's dual-item list (walked fault-safe by
+//     ge_find_dual_partner) has a {3, idA, idB} record containing weapon_id,
+//     hand 1 <- the other id in that record (usually == weapon_id), granting
+//     both hands the dual weapon; otherwise hand 1 still gets the explicit
+//     clear above.
+// Always issues the pair and returns true -- the pair-call has no failure
+// mode of its own (sub_820A6F70 has no validation, see round-2 Q2). The bool
+// return is kept for a future compile-out safety switch, not because this
+// can fail today.
+//
+// MUST run on a guest thread inside a midasm hook. The full-context
+// save/restore is required: we are mid-way through ge_inject_keyboard's host
+// hook, and the generated caller resumes from ctx after we return -- a guest
+// call here clobbers volatile registers/lr otherwise. One save covers both
+// calls; there must be no return between them (same-quantum requirement).
+// ===========================================================================
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id) {
+  const int32_t before = (int32_t)dbg_safe_ld32(base, 0x447f10b0u);  // equipped-id block
+
+  int32_t partner = 0;
+  const bool dual = ge_find_dual_partner(base, weapon_id, &partner);
+  const int32_t off_hand_id = dual ? partner : 0;
+
+  const PPCContext saved = *ctx;
+
+  // sub_820A6F70(hand, weapon id, direction/mode) -- the sole funnel for the
+  // native Y-cycle input paths (Findings 2026-07). Both calls land in this
+  // one hook invocation, back-to-back, so hand 1's requested-state is armed
+  // before hand 0's swap point runs.
+  ctx->r3.u32 = 0u;                        // hand 0 = main hand
+  ctx->r4.u32 = (uint32_t)weapon_id;       // raw weapon id (verified: applier takes ids)
+  ctx->r5.u32 = 1u;                        // direction/mode; constant 1 on all native paths
+  sub_820A6F70(*ctx, base);
+
+  ctx->r3.u32 = 1u;                        // hand 1 = off hand
+  ctx->r4.u32 = (uint32_t)off_hand_id;     // dual partner id, or 0 = explicit clear
+  ctx->r5.u32 = 1u;
+  sub_820A6F70(*ctx, base);
+
+  *ctx = saved;
+  REXKRNL_INFO("GEWPN direct equip id={} dual={} equip_before={} equip_after={}",
+               weapon_id, dual, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+  return true;
 }
 
 // ===========================================================================
@@ -799,7 +1988,8 @@ bool ge_ce_intro_gfx(PPCRegister& /*r3*/) { return true; }
 // functions are called directly via their generated sub_ symbols. 1:1 with
 // finalizer.c.
 // ===========================================================================
-namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
+// GE_NET_FLAG (byte @0x830CAEA0u, !=0 = network MP session) is declared above,
+// near ge_inject_keyboard, which also needs it.
 
 // disable_doors_autoclosing_on_mp @0x820E4F1C (after `lwz r11,0xE8(r30)` loads
 // the door open-tick): in a network session, force it to 0 so doors never

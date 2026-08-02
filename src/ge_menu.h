@@ -37,6 +37,18 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
     // server / online-enable cvars so they take effect on a clean reboot (they
     // are read at startup, not live).
     std::function<void()> request_restart;
+    // Per-frame perf-counter CSV recording (rex::perf). get reports whether a
+    // capture is running; set(true) starts one (path chosen by the app, under
+    // the user data dir), set(false) stops and flushes it.
+    std::function<bool()> get_perf_csv;
+    std::function<void(bool)> set_perf_csv;
+    // Invoked (deferred to the UI loop by the app) after the menu changes
+    // ge_fps_overlay / postfx_enabled / applies a preset, so the app can
+    // create/destroy the overlay dialogs to match. Overlay dialogs are only
+    // kept alive while they draw: a registered (even invisible) UI drawer
+    // pins every present to the UI thread (Presenter paint-mode selection),
+    // killing the low-latency guest-thread present path.
+    std::function<void()> overlays_changed;
   };
 
   GeMenuDialog(rex::ui::ImGuiDrawer* drawer, Callbacks callbacks);
@@ -63,6 +75,11 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   ImVec2 f0_{};      // folder body top-left (screen coords)
   ImVec2 f1_{};      // folder body bottom-right
   float tab_w_ = 0;  // width of the right-edge tab strip
+
+  // INPUT tab: which keybind cvar is currently capturing a key (nullptr = none),
+  // and a one-frame guard so the click that starts a rebind isn't itself bound.
+  const char* rebinding_cvar_ = nullptr;
+  int rebind_skip_ = 0;
 
   // Placeholder audio state (engine wiring comes later).
   float vol_master_ = 0.80f;

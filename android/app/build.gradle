@@ -2,17 +2,35 @@ plugins {
     id 'com.android.application'
 }
 
+// Release signing is LOCAL-ONLY: credentials live in android/keystore.properties
+// (gitignored). When the file is absent (e.g. public compile-verify CI) the
+// signingConfig is skipped so configuration still succeeds.
+def ksPropsFile = rootProject.file('keystore.properties')
+def ksProps = new Properties()
+if (ksPropsFile.exists()) { ksProps.load(new FileInputStream(ksPropsFile)) }
+
 android {
     namespace 'com.sunjaycy.goldeneye'
     compileSdk 34
     ndkVersion '27.1.12297006'
 
+    signingConfigs {
+        release {
+            if (ksPropsFile.exists()) {
+                storeFile rootProject.file(ksProps['storeFile'])
+                storePassword ksProps['storePassword']
+                keyAlias ksProps['keyAlias']
+                keyPassword ksProps['keyPassword']
+            }
+        }
+    }
+
     defaultConfig {
         applicationId 'com.sunjaycy.goldeneye'
         minSdk 29          // Vulkan-capable baseline (matches ANDROID_PLATFORM)
         targetSdk 34
-        versionCode 1
-        versionName '0.1'
+        versionCode 12
+        versionName '1.5.0'
 
         ndk {
             abiFilters 'arm64-v8a'   // 64-bit only: the guest needs a 4 GiB address space
@@ -20,6 +38,9 @@ android {
 
         externalNativeBuild {
             cmake {
+                // RelWithDebInfo for ALL variants (incl. debug): the recomp is
+                // unplayable at Debug/-O0, and every on-device timing behavior
+                // (freeze fix, watchdog, boot heartbeat) was verified at RWDI.
                 arguments "-DREXSDK_DIR=${file(rootProject.findProperty('rexSdkDir') ?: '../../GoldenEye-Recomp-rexglue').absolutePath}",
                           '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
                 // C++23; libc++ jthread/stop_token need the experimental library.
@@ -42,8 +63,18 @@ android {
     // AGP picks up the target `ge` and its shared-lib dependencies automatically.
 
     buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable true
+            // Keep extractNativeLibs=true so simpleperf / run-as can access .so files on-disk.
+            manifestPlaceholders = [extractNativeLibs: 'true']
+        }
         release {
+            debuggable false
             minifyEnabled false
+            // Uncompressed libs in APK: loaded directly via mmap, no disk extraction.
+            manifestPlaceholders = [extractNativeLibs: 'false']
+            if (ksPropsFile.exists()) { signingConfig signingConfigs.release }
         }
     }
 

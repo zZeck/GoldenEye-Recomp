@@ -5,6 +5,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
+import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -13,7 +15,10 @@ import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
+import android.view.Display;
 import android.view.Gravity;
+import android.view.InputDevice;
+import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -23,7 +28,10 @@ import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * Thin Java shell over NativeActivity.
@@ -54,19 +62,33 @@ import java.io.FileReader;
  * game surface, shown during boot/retries and removed once frames appear.
  */
 public class GoldenEyeActivity extends NativeActivity {
+    // NOTE on the nativeProvide/Release/Touch methods below: NativeActivity
+    // dlopens libge.so through its own native loader, which does NOT register
+    // the library with ART, so name-based resolution would throw
+    // UnsatisfiedLinkError. System.loadLibrary("ge") here is NOT the fix: it
+    // invokes the bundled SDL3's JNI_OnLoad, which FindClass()es the SDL Java
+    // glue (org.libsdl.app.*) this app doesn't ship and JNI-aborts the process.
+    // Instead native code registers the methods explicitly (RegisterNatives in
+    // ge_android_ds.cpp, called from GeApp::OnConfigurePaths) early in
+    // android_main -- long before renderLive gates the first call from here.
     private static final String TAG = "GEBOOT";
     // A healthy boot creates its swapchain ~2s after launch and reaches a live
-    // render (present#65) within ~5s; this window leaves a wide margin (incl. a
+    // render (rendered#65) within ~5s; this window leaves a wide margin (incl. a
     // cold shader cache on first run) while keeping failed-boot retries quick.
     private static final int BOOT_WATCHDOG_MS = 16000;
     private static final int POLL_MS = 2000;
     private static final int MAX_BOOT_ATTEMPTS = 10;
     private static final String ATTEMPT_EXTRA = "ge_boot_attempt";
 
-    // Present counter is logged as "GEGPU present#N" every 64 frames; N>=65 means
-    // >=64 frames presented = a real render loop (a wedged boot can emit a lone
-    // "present#1" then freeze, so any "present#" is not enough).
-    private static final int PRESENT_THRESHOLD = 65;
+    // Real-render counter, logged as "GEGPU rendered#N" every 64 frames; N>=65
+    // means >=64 frames actually reached the screen = a live render loop. We gate
+    // on this, NOT on "GEGPU present#", because present# (and the CP swap counter)
+    // keep advancing on a WEDGED boot -- VdSwap still fires while render is skipped
+    // every frame -- so a frozen boot would be mistaken for "live". "rendered#" is
+    // emitted only from the drawn branch of ge_dbg_now (presented:=submit), so it
+    // stops the instant the game freezes, letting the loader relaunch and re-roll
+    // the residual ~50% boot race.
+    private static final int RENDER_THRESHOLD = 65;
 
     private volatile boolean relaunching;
     private volatile boolean stopWatchdog;
@@ -78,14 +100,31 @@ public class GoldenEyeActivity extends NativeActivity {
     private Handler overlayHandler;
     private View overlayView;
     private TextView overlayText;
+    private ProgressBar overlaySpinner;
     private int dotPhase;
+
+    // Dual-screen weapon menu (AYN Thor secondary display). The Presentation hosts
+    // a SurfaceView whose Surface is handed to native code; native renders the
+    // ImGui weapon menu into it. Null whenever there is no secondary display
+    // (single-screen fallback).
+    private DisplayManager displayManager;
+    private DisplayManager.DisplayListener displayListener;
+    private WeaponMenuPresentation weaponPresentation;
+
+    // On-screen touch controls (ordinary phones/tablets with no controller). A
+    // translucent, non-focusable panel window over the game; shown per the
+    // ge_touch_controls policy and controller presence (InputManager).
+    private InputManager inputManager;
+    private InputManager.InputDeviceListener inputDeviceListener;
+    private TouchControlsView touchView;
+    private boolean touchOverlayAdded;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         attempt = getIntent() != null ? getIntent().getIntExtra(ATTEMPT_EXTRA, 0) : 0;
 
         // Start each launch with a fresh log so the watchdog only sees THIS
-        // process's "present#" markers (the runtime appends across launches).
+        // process's "rendered#" markers (the runtime appends across launches).
         try {
             File log = new File(getExternalFilesDir(null), "ge.log");
             if (log.exists()) {
@@ -94,6 +133,11 @@ public class GoldenEyeActivity extends NativeActivity {
         } catch (Throwable t) {
             // best-effort
         }
+
+        // First-install shader/pipeline storage seed: gives the runtime's
+        // boot-time precompile something to chew on, so first-shot pipeline
+        // compiles happen behind the loader screen instead of mid-combat.
+        seedShaderStorageFromAssets();
 
         super.onCreate(savedInstanceState);
 
@@ -118,6 +162,81 @@ public class GoldenEyeActivity extends NativeActivity {
         watchdogThread = new Thread(this::bootWatchdogRun, "ge-boot-watchdog");
         watchdogThread.setDaemon(true);
         watchdogThread.start();
+
+        // Watch for a secondary display appearing/disappearing (dock, hotplug).
+        // The actual binding is (re)established in onResume / onDisplay* below.
+        displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+        if (displayManager != null) {
+            displayListener = new DisplayManager.DisplayListener() {
+                @Override public void onDisplayAdded(int displayId) { updateSecondaryDisplay(); }
+                @Override public void onDisplayRemoved(int displayId) { updateSecondaryDisplay(); }
+                @Override public void onDisplayChanged(int displayId) { updateSecondaryDisplay(); }
+            };
+            displayManager.registerDisplayListener(displayListener, null);
+        }
+
+        // Watch for controllers connecting/disconnecting so the on-screen touch
+        // controls can auto-hide/appear. Callbacks are delivered on this (main)
+        // thread's looper (null handler), where View/WindowManager ops are legal.
+        inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
+        if (inputManager != null) {
+            inputDeviceListener = new InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int deviceId) { updateTouchControls(); }
+                @Override public void onInputDeviceRemoved(int deviceId) { updateTouchControls(); }
+                @Override public void onInputDeviceChanged(int deviceId) { updateTouchControls(); }
+            };
+            inputManager.registerInputDeviceListener(inputDeviceListener, null);
+        }
+    }
+
+    /**
+     * Copy bundled shader-storage seed files (assets/shader_seed/*) into the
+     * runtime's cache dir, only when absent. tmp+rename so a mid-copy kill
+     * can't leave a truncated file; every failure is non-fatal (the game just
+     * boots seedless, as before this feature). See
+     * docs/superpowers/specs/2026-07-11-shader-seed-bundling-design.md.
+     */
+    private void seedShaderStorageFromAssets() {
+        try {
+            String[] names = getAssets().list("shader_seed");
+            if (names == null || names.length == 0) {
+                return;
+            }
+            File destDir = new File(getExternalFilesDir(null), "cache/shaders/shareable");
+            byte[] buf = new byte[65536];
+            for (String name : names) {
+                try {
+                    File dest = new File(destDir, name);
+                    if (dest.exists()) {
+                        continue;
+                    }
+                    if (!destDir.isDirectory() && !destDir.mkdirs()) {
+                        Log.w(TAG, "shader seed: cannot create " + destDir);
+                        return;
+                    }
+                    File tmp = new File(destDir, name + ".tmp");
+                    long bytes = 0;
+                    try (InputStream in = getAssets().open("shader_seed/" + name);
+                         OutputStream out = new FileOutputStream(tmp)) {
+                        int n;
+                        while ((n = in.read(buf)) != -1) {
+                            out.write(buf, 0, n);
+                            bytes += n;
+                        }
+                    }
+                    if (tmp.renameTo(dest)) {
+                        Log.i(TAG, "shader seed: copied " + name + " (" + bytes + " bytes)");
+                    } else {
+                        Log.w(TAG, "shader seed: rename failed for " + name);
+                        tmp.delete();
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "shader seed: copy failed for " + name + " (continuing)", t);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "shader seed: copy failed (continuing without)", t);
+        }
     }
 
     @Override
@@ -152,10 +271,30 @@ public class GoldenEyeActivity extends NativeActivity {
             if (hasStartedPresenting()) {
                 Log.i(TAG, "boot attempt " + attempt + " OK (presenting)");
                 hideOverlay();
+                // The render loop is live, so native init (including the
+                // RegisterNatives for the dual-screen JNI methods) finished long
+                // ago -- it is now safe to bring up the second-screen menu.
+                renderLive = true;
+                runOnUiThread(this::updateSecondaryDisplay);
+                runOnUiThread(this::updateTouchControls);
+                return;
+            }
+            String missing = readMissingFilesError();
+            if (missing != null) {
+                // Native vetoed the guest launch (required game files absent)
+                // and stays alive; this boot is not a wedge to retry -- turn
+                // the spinner into the error screen and stop.
+                Log.w(TAG, "boot attempt " + attempt + " -> missing game files, showing error");
+                showBootError(missing);
                 return;
             }
         }
         if (stopWatchdog || relaunching) {
+            return;
+        }
+        String missing = readMissingFilesError();
+        if (missing != null) {
+            showBootError(missing);
             return;
         }
         if (attempt + 1 >= MAX_BOOT_ATTEMPTS) {
@@ -166,7 +305,86 @@ public class GoldenEyeActivity extends NativeActivity {
         relaunchSelf(attempt + 1);
     }
 
-    /** True once the native runtime has a LIVE render loop (>= PRESENT_THRESHOLD frames). */
+    /**
+     * If the native asset check refused to launch, ge.log carries GEMISSING
+     * markers (summary line first, then up to 50 file= lines). Returns a
+     * user-facing message built from them, or null when no marker is present.
+     *
+     * Also recognizes the runtime's "Entrypoint XEX not found" error: with
+     * default.xex absent (e.g. a completely empty install -- every new user's
+     * first run) the runtime aborts BEFORE the manifest check can run, so no
+     * GEMISSING markers exist and only this line names the failure.
+     */
+    private String readMissingFilesError() {
+        File log = new File(getExternalFilesDir(null), "ge.log");
+        if (!log.exists()) {
+            return null;
+        }
+        int total = -1;
+        StringBuilder files = new StringBuilder();
+        int listed = 0;
+        try (BufferedReader r = new BufferedReader(new FileReader(log))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.contains("Entrypoint XEX not found")) {
+                    return "Game files not found (default.xex is missing).\n\n"
+                         + "Copy the complete GoldenEye 007 game dump into\n"
+                         + "Android/data/" + getPackageName() + "/files";
+                }
+                int idx = line.indexOf("GEMISSING total=");
+                if (idx >= 0) {
+                    int j = idx + "GEMISSING total=".length();
+                    int n = 0;
+                    while (j < line.length() && Character.isDigit(line.charAt(j))) {
+                        n = n * 10 + (line.charAt(j) - '0');
+                        j++;
+                    }
+                    total = n;
+                    continue;
+                }
+                idx = line.indexOf("GEMISSING file=");
+                if (idx >= 0 && listed < 8) {
+                    files.append('\n').append(line.substring(idx + "GEMISSING file=".length()).trim());
+                    listed++;
+                }
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        if (total < 0) {
+            return null;
+        }
+        StringBuilder msg = new StringBuilder();
+        msg.append("Missing ").append(total).append(" required game file")
+           .append(total == 1 ? "" : "s").append(':').append(files);
+        if (total > listed) {
+            msg.append("\n...and ").append(total - listed).append(" more");
+        }
+        msg.append("\n\nCopy the complete GoldenEye 007 game dump into\n")
+           .append("Android/data/").append(getPackageName()).append("/files\n")
+           .append("(full list: files/user/ge_missing_files.txt)");
+        return msg.toString();
+    }
+
+    /** Turn the loading overlay into a persistent error screen (no retry). */
+    private void showBootError(String message) {
+        if (overlayHandler == null) {
+            return;
+        }
+        overlayHandler.post(() -> {
+            if (overlayView == null || overlayText == null) {
+                return;
+            }
+            overlayHandler.removeCallbacks(dotRunnable);  // stop "Loading..." updates
+            if (overlaySpinner != null) {
+                overlaySpinner.setVisibility(View.GONE);
+            }
+            overlayText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            overlayText.setText(message);
+        });
+    }
+
+    /** True once the native runtime has a LIVE render loop (>= RENDER_THRESHOLD real frames). */
     private boolean hasStartedPresenting() {
         File log = new File(getExternalFilesDir(null), "ge.log");
         if (!log.exists()) {
@@ -175,17 +393,17 @@ public class GoldenEyeActivity extends NativeActivity {
         try (BufferedReader r = new BufferedReader(new FileReader(log))) {
             String line;
             while ((line = r.readLine()) != null) {
-                int idx = line.indexOf("present#");
+                int idx = line.indexOf("rendered#");
                 if (idx < 0) {
                     continue;
                 }
-                int j = idx + "present#".length();
+                int j = idx + "rendered#".length();
                 int n = 0;
                 while (j < line.length() && Character.isDigit(line.charAt(j))) {
                     n = n * 10 + (line.charAt(j) - '0');
                     j++;
                 }
-                if (n >= PRESENT_THRESHOLD) {
+                if (n >= RENDER_THRESHOLD) {
                     return true;
                 }
             }
@@ -240,6 +458,7 @@ public class GoldenEyeActivity extends NativeActivity {
             ProgressBar spinner = new ProgressBar(ctx);  // default = indeterminate circle
             LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(dp(56), dp(56));
             col.addView(spinner, sp);
+            overlaySpinner = spinner;
 
             TextView tv = new TextView(ctx);
             tv.setText("Loading GoldenEye");
@@ -278,6 +497,7 @@ public class GoldenEyeActivity extends NativeActivity {
             Log.e(TAG, "overlay show failed", t);
             overlayView = null;
             overlayText = null;
+            overlaySpinner = null;
         }
     }
 
@@ -315,6 +535,7 @@ public class GoldenEyeActivity extends NativeActivity {
                 }
                 overlayView = null;
                 overlayText = null;
+                overlaySpinner = null;
             }
         });
     }
@@ -323,12 +544,321 @@ public class GoldenEyeActivity extends NativeActivity {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
+    // --- Dual-screen weapon menu --------------------------------------------
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updateSecondaryDisplay();
+        updateTouchControls();
+    }
+
+    @Override
+    protected void onPause() {
+        // Drop the secondary surface while backgrounded; native tears its surface
+        // down cleanly and re-creates it on the next resume.
+        teardownSecondaryDisplay();
+        removeTouchOverlay();
+        super.onPause();
+    }
+
+    /** Bring the weapon menu up if a secondary display exists, else tear it down. */
+    private void updateSecondaryDisplay() {
+        // Wait for a live render loop before creating the presentation: it keeps
+        // the boot visuals clean AND guarantees the native side has registered
+        // the JNI methods below (RegisterNatives runs early in android_main,
+        // rendered#65 comes seconds later).
+        if (!renderLive) {
+            return;
+        }
+        Display secondary = pickSecondaryDisplay();
+        if (secondary == null) {
+            teardownSecondaryDisplay();   // single-screen fallback
+            return;
+        }
+        if (weaponPresentation != null) {
+            if (weaponPresentation.getDisplay() != null
+                    && weaponPresentation.getDisplay().getDisplayId() == secondary.getDisplayId()
+                    && weaponPresentation.isShowing()) {
+                return;  // already showing on this display
+            }
+            teardownSecondaryDisplay();
+        }
+        try {
+            weaponPresentation = new WeaponMenuPresentation(this, secondary, this);
+            weaponPresentation.show();
+            Log.i(TAG, "weapon menu presentation shown on display " + secondary.getDisplayId());
+        } catch (Throwable t) {
+            Log.e(TAG, "failed to show weapon menu presentation", t);
+            weaponPresentation = null;
+        }
+    }
+
+    /** The first non-default (presentation) display, or null on a single-screen device. */
+    private Display pickSecondaryDisplay() {
+        if (displayManager == null) {
+            return null;
+        }
+        Display[] presentation =
+            displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
+        if (presentation != null && presentation.length > 0) {
+            return presentation[0];
+        }
+        for (Display d : displayManager.getDisplays()) {
+            if (d.getDisplayId() != Display.DEFAULT_DISPLAY) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    private void teardownSecondaryDisplay() {
+        if (weaponPresentation != null) {
+            try {
+                weaponPresentation.dismiss();
+            } catch (Throwable t) {
+                // ignore
+            }
+            weaponPresentation = null;
+        }
+        releaseSecondarySurface();
+    }
+
+    // Called by WeaponMenuPresentation on the main thread. The try/catch is a
+    // failsafe: renderLive gating means RegisterNatives has always run by the
+    // time these are reachable, but a dropped registration must degrade to
+    // "no second-screen menu", never crash the game.
+    void provideSecondarySurface(Surface surface, int width, int height) {
+        try {
+            nativeProvideSecondaryDisplaySurface(surface, width, height);
+            secondarySurfaceProvided = true;
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DS natives not registered; second screen disabled", e);
+        }
+    }
+
+    void releaseSecondarySurface() {
+        // Skip the JNI call when nothing was ever handed to native (every
+        // onPause on a single-screen device goes through here).
+        if (!secondarySurfaceProvided) {
+            return;
+        }
+        secondarySurfaceProvided = false;
+        try {
+            nativeReleaseSecondaryDisplaySurface();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DS natives not registered on release", e);
+        }
+    }
+
+    private boolean secondarySurfaceProvided;
+    private volatile boolean renderLive;
+
+    void forwardSecondaryTouch(int pointerId, int action, float x, float y) {
+        if (!secondarySurfaceProvided) {
+            return;
+        }
+        try {
+            nativeSecondaryTouch(pointerId, action, x, y);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DS natives not registered on touch", e);
+        }
+    }
+
+    // Implemented in src/ge_android_ds.cpp (libge.so).
+    private native void nativeProvideSecondaryDisplaySurface(Surface surface, int width, int height);
+    private native void nativeReleaseSecondaryDisplaySurface();
+    private native void nativeSecondaryTouch(int pointerId, int action, float x, float y);
+
+    // --- On-screen touch controls -------------------------------------------
+
+    /** True if a real (non-virtual) gamepad/joystick is currently connected. */
+    private boolean hasGamepad() {
+        if (inputManager == null) {
+            return false;
+        }
+        for (int id : inputManager.getInputDeviceIds()) {
+            InputDevice d = inputManager.getInputDevice(id);
+            if (d == null || d.isVirtual()) {
+                continue;
+            }
+            int sources = d.getSources();
+            boolean gamepad = (sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD;
+            boolean joystick = (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+            if (gamepad || joystick) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Show or hide the touch overlay per ge_touch_controls (auto|on|off) and
+     * controller presence. Gated on renderLive so it never fights the boot
+     * visuals / precedes native JNI registration. Main-thread only.
+     */
+    private void updateTouchControls() {
+        if (!renderLive) {
+            return;
+        }
+        String mode = touchControlsMode();
+        boolean show;
+        if ("off".equalsIgnoreCase(mode)) {
+            show = false;
+        } else if ("on".equalsIgnoreCase(mode)) {
+            show = true;
+        } else {
+            show = !hasGamepad();  // "auto"
+        }
+        if (show) {
+            addTouchOverlay();
+        } else {
+            removeTouchOverlay();
+        }
+    }
+
+    private void addTouchOverlay() {
+        if (touchOverlayAdded) {
+            return;
+        }
+        final IBinder token = getWindow().getDecorView().getWindowToken();
+        if (token == null) {
+            return;
+        }
+        try {
+            if (touchView == null) {
+                touchView = new TouchControlsView(this, this);
+            }
+            touchView.refreshConfig();
+            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
+            wlp.type = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL;
+            wlp.token = token;
+            wlp.width = WindowManager.LayoutParams.MATCH_PARENT;
+            wlp.height = WindowManager.LayoutParams.MATCH_PARENT;
+            wlp.format = PixelFormat.TRANSLUCENT;
+            // NOT_FOCUSABLE keeps this window out of key/IME focus (so it can't
+            // feed the vendor IME focus storm) while still receiving the touches
+            // that land on it. Do NOT set NOT_TOUCHABLE - the controls need them.
+            wlp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                      | WindowManager.LayoutParams.FLAG_FULLSCREEN;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                wlp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            }
+            wlp.gravity = Gravity.TOP | Gravity.START;
+            getWindowManager().addView(touchView, wlp);
+            touchOverlayAdded = true;
+            Log.i(TAG, "touch controls shown");
+        } catch (Throwable t) {
+            Log.e(TAG, "touch overlay add failed", t);
+        }
+    }
+
+    private void removeTouchOverlay() {
+        if (!touchOverlayAdded) {
+            return;
+        }
+        touchOverlayAdded = false;
+        try {
+            // Detaching pushes a zeroed pad frame (TouchControlsView.onDetached).
+            getWindowManager().removeViewImmediate(touchView);
+        } catch (Throwable t) {
+            // ignore
+        }
+    }
+
+    // Native accessors used by TouchControlsView. Each degrades gracefully if the
+    // JNI methods failed to register (returns a sensible default), matching the
+    // dual-screen forwarding pattern.
+    void forwardTouchState(int buttons, int lt, int rt, int lx, int ly, int rx, int ry) {
+        try {
+            nativeSetTouchState(buttons, lt, rt, lx, ly, rx, ry);
+        } catch (UnsatisfiedLinkError e) {
+            // touch natives not registered; drop
+        }
+    }
+
+    String touchControlsMode() {
+        try {
+            return nativeTouchControlsMode();
+        } catch (UnsatisfiedLinkError e) {
+            return "auto";
+        }
+    }
+
+    String touchLookMode() {
+        try {
+            return nativeTouchLookMode();
+        } catch (UnsatisfiedLinkError e) {
+            return "swipe";
+        }
+    }
+
+    float touchLookSens() {
+        try {
+            return nativeTouchLookSens();
+        } catch (UnsatisfiedLinkError e) {
+            return 1.0f;
+        }
+    }
+
+    float touchOpacity() {
+        try {
+            return nativeTouchOpacity();
+        } catch (UnsatisfiedLinkError e) {
+            return 0.5f;
+        }
+    }
+
+    void requestEquipWeapon(int id) {
+        try {
+            nativeRequestEquipWeapon(id);
+        } catch (UnsatisfiedLinkError e) {
+            // ignore
+        }
+    }
+
+    int equippedWeaponId() {
+        try {
+            return nativeEquippedWeaponId();
+        } catch (UnsatisfiedLinkError e) {
+            return -1;
+        }
+    }
+
+    int carriedWeapons(int[] ids, int[] ammo) {
+        try {
+            return nativeCarriedWeapons(ids, ammo);
+        } catch (UnsatisfiedLinkError e) {
+            return -1;
+        }
+    }
+
+    // Implemented in src/ge_android_touch.cpp (libge.so).
+    private native void nativeSetTouchState(int buttons, int lt, int rt, int lx, int ly, int rx, int ry);
+    private native String nativeTouchControlsMode();
+    private native String nativeTouchLookMode();
+    private native float nativeTouchLookSens();
+    private native float nativeTouchOpacity();
+    private native void nativeRequestEquipWeapon(int id);
+    private native int nativeEquippedWeaponId();
+    private native int nativeCarriedWeapons(int[] ids, int[] ammo);
+
     @Override
     protected void onDestroy() {
         stopWatchdog = true;
         if (watchdogThread != null) {
             watchdogThread.interrupt();
         }
+        if (displayManager != null && displayListener != null) {
+            displayManager.unregisterDisplayListener(displayListener);
+        }
+        if (inputManager != null && inputDeviceListener != null) {
+            inputManager.unregisterInputDeviceListener(inputDeviceListener);
+        }
+        teardownSecondaryDisplay();
+        removeTouchOverlay();
         hideOverlay();
         if (overlayThread != null) {
             overlayThread.quitSafely();
@@ -342,6 +872,63 @@ public class GoldenEyeActivity extends NativeActivity {
         if (hasFocus) {
             hideSystemUi();
         }
+        noteFocusChangeForStormBreaker();
+    }
+
+    // --- IME focus-storm breaker ---------------------------------------------
+    //
+    // The Ayn Thor's vendor InputMethodManagerService has a second-display IME
+    // target loop (updateImeInputAndControlTargetForSecond ping-ponging between
+    // this activity on display 0 and launcher3's SecondaryDisplayLauncher on the
+    // bottom panel): window focus flaps at ~90-140Hz, each flap re-running
+    // startInput. Each round costs fds (input channels, fd-carrying parcels) on
+    // top of Adreno fence fds, so after ~30-60s the process hits EMFILE and dies
+    // on a binder failure dressed up as DeadSystemException (2026-07-04, twice).
+    //
+    // Normal play sees a handful of focus changes total, the storm sees dozens
+    // per second - so on a burst of FOCUS_STORM_THRESHOLD changes inside
+    // FOCUS_STORM_WINDOW_MS, temporarily mark the window ALT_FOCUSABLE_IM. That
+    // takes it out of IME-target selection entirely (startInputAsyncOnWindow-
+    // FocusGain early-outs), starving the vendor loop of its display-0 target so
+    // it settles; the flag is cleared after a cooldown so the soft keyboard
+    // works again. Runs on the main thread (focus callbacks + window flags).
+    private static final int FOCUS_STORM_THRESHOLD = 10;
+    private static final long FOCUS_STORM_WINDOW_MS = 1000;
+    private static final long FOCUS_STORM_COOLDOWN_MS = 10000;
+    private final long[] focusChangeTimes = new long[FOCUS_STORM_THRESHOLD];
+    private int focusChangeIdx;
+    private boolean imeStormDefenseActive;
+    private Handler mainHandler;  // created on first use; ctor needs the main Looper
+
+    private void noteFocusChangeForStormBreaker() {
+        long now = SystemClock.elapsedRealtime();
+        focusChangeTimes[focusChangeIdx] = now;
+        focusChangeIdx = (focusChangeIdx + 1) % FOCUS_STORM_THRESHOLD;
+        if (imeStormDefenseActive) {
+            return;
+        }
+        // After the write+advance, the slot at focusChangeIdx holds the oldest of
+        // the last THRESHOLD changes (0 until the ring has filled once).
+        long oldest = focusChangeTimes[focusChangeIdx];
+        if (oldest != 0 && now - oldest <= FOCUS_STORM_WINDOW_MS) {
+            imeStormDefenseActive = true;
+            Log.w(TAG, "GEIME focus storm: " + FOCUS_STORM_THRESHOLD + " focus changes in "
+                    + (now - oldest) + "ms; engaging FLAG_ALT_FOCUSABLE_IM for "
+                    + FOCUS_STORM_COOLDOWN_MS + "ms");
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+            if (mainHandler == null) {
+                mainHandler = new Handler(getMainLooper());
+            }
+            mainHandler.postDelayed(this::disengageStormDefense, FOCUS_STORM_COOLDOWN_MS);
+        }
+    }
+
+    private void disengageStormDefense() {
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+        java.util.Arrays.fill(focusChangeTimes, 0);
+        focusChangeIdx = 0;
+        imeStormDefenseActive = false;
+        Log.i(TAG, "GEIME focus storm defense disengaged (re-arms if the storm resumes)");
     }
 
     @SuppressWarnings("deprecation")

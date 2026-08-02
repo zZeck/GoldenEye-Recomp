@@ -115,14 +115,30 @@ return_on_true = true
 # ===========================================================================
 # BeanTools Community Edition patches (see src/ge_ce_patches.cpp + ge_hooks.cpp).
 # ===========================================================================
-# CE data bug-fix bootstrap: apply the data-only patches once, on the first input
-# poll (after XamInputGetState fills the slot-0 gamepad buffer), before any level
-# loads its setup/fog/BG data. Runs and continues normally (no jump/return).
+# NOTE: the CE data bug-fixes are bootstrapped from inside ge_inject_keyboard
+# (below) on its first invocation -- see ge_apply_ce_data_patches() -- rather
+# than via a separate hook, since both need the same slot-0 input-poll site
+# (0x823B25E4) and only one midasm hook may bind a given guest address.
+# Mouse-look is now a once-per-frame port of the xenia-canary mousehook
+# (ge_mouse_camera in ge_hooks.cpp), driven from ge_inject_keyboard below. The
+# old per-site ge_bondview_control look hooks are gone.
+# KEYBOARD: after XamInputGetState fills the slot-0 gamepad buffer (unk_830C8B9C)
+# and before ge_input_poll_controllers dispatches it -> OR keyboard buttons in.
 [[midasm_hook]]
 address = 0x823B25E4
-name = "ge_ce_bootstrap"
-registers = []
+name = "ge_inject_keyboard"
+registers = ["r11"]
 after_instruction = true
+# Phase-1 discovery (weapon direct-switch RE): entry of sub_820A7508, the
+# per-hand weapon applier. Logs caller lr + args; diag-gated in ge_hooks.cpp.
+[[midasm_hook]]
+address = 0x820A7508
+name = "ge_dbg_weapon_apply"
+registers = ["r3", "r4"]
+after_instruction = false
+# NOTE: upstream's ge_debug_gate (hidden debug-menu enable @0x82189F2C) is NOT
+# pulled in -- its implementation lives in an earlier upstream commit that isn't on
+# this branch, and it is not part of the CE patch set.
 # --- BeanTools Community Edition CODE fixes (instruction patches; see ge_hooks.cpp) ---
 # fix_door_volume_clamp @0x820DD814: li r3,0 -> li r3,1
 [[midasm_hook]]
