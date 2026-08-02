@@ -1,4 +1,4 @@
-# GoldenEye 007 — PC Recompilation (zZeck integration fork)
+# GoldenEye 007 — PC Recompilation (zZeck integration fork made with Kiro)
 
 A native PC port of **GoldenEye 007 (Xbox 360 / XBLA)**, built by *statically
 recompiling* the original game into C++ with the
@@ -8,7 +8,7 @@ the game runs as a real native executable on **Windows** and **Linux**.
 > [!IMPORTANT]
 > **This repository contains _no_ game code or assets.** It is only the source
 > that wraps the game (menus, hooks, online, post-FX, build config). You must
-> supply the game files yourself. This game never released publicly.
+> supply the game files yourself.
 
 ## About this fork
 
@@ -190,7 +190,6 @@ WINEDEBUG=-all wine GoldenEye.exe   # from a folder containing assets/ + the DLL
 Release build into `dist/`:
 
 ```sh
-scripts/package_windows.sh              # binaries + your assets/
 scripts/package_windows.sh --no-assets  # binaries only (user supplies assets/)
 ```
 
