@@ -214,25 +214,30 @@ inline constexpr uint32_t kAmmoStride      = 2u;  // bytes between ammo entries 
 inline constexpr uint32_t kNumSlots        = 0u;  // weapon slots to scan (<= kMaxWeaponSlots)
 
 // ---------------------------------------------------------------------------
-// DIRECT (absolute-address) read path -- CONFIRMED ON DESKTOP 2026-07-02.
-// The guest heap is deterministic: the equipped-weapon state block sits at a
-// FIXED guest address every boot (verified identical across two app restarts),
-// so we address it directly instead of chasing a pointer chain. These are the
-// live equipped-weapon fields; the full per-weapon inventory array (reserve +
-// held set) is not mapped yet, so this path publishes a one-weapon snapshot
-// (the equipped weapon + its clip). 0 => direct path disabled.
-inline constexpr uint32_t kEquipIdAddr   = 0x447f10b0u;  // 32-bit equipped weapon id
-inline constexpr uint32_t kEquipIdAddr2  = 0x447f10c8u;  // 32-bit equipped id (agreement gate)
-inline constexpr uint32_t kClipAddr      = 0x447f10f4u;  // 32-bit current-weapon clip
-inline constexpr uint32_t kWeaponDefAddr = 0x447f10c0u;  // 32-bit per-weapon def ptr (in-game gate)
+// PLAYER-RELATIVE weapon-block layout.
+//   Discovered 2026-07 as fixed absolute addresses (players[0]'s copy, e.g.
+//   equipped id at 0x447f10b0), then found 2026-08 to be per-player struct
+//   fields: the weapon block lives INSIDE each player entity at fixed offsets
+//   (players[0] base 0x447F07A0 -> equipped id at +0x910, list head at +0x128c).
+//   GE_PLAYER_PTR (0x82F1FA98) is an array of 4 identical-struct pointers, so we
+//   read the block relative to the LOCAL active-viewport player: host resolves
+//   to players[0], online clients to players[1..3], each seeing its OWN weapon.
+//   (The old absolute addresses were players[0]-only, so online clients read the
+//   HOST's weapon -> equip requests never converged -> "random weapon cycling".)
+inline constexpr bool     kWeaponBlockEnabled = true;        // false => read path off
+inline constexpr uint32_t kPlayerArrayAddr    = 0x82F1FA98u; // -> players[0..3] pointers
+inline constexpr uint32_t kViewportOff        = 0x904u;      // ==0 for the local console's player
+inline constexpr uint32_t kOffEquipId         = 0x910u;      // player + this = equipped id
+inline constexpr uint32_t kOffEquipId2        = 0x928u;      // agreement-gate copy
+inline constexpr uint32_t kOffWeaponDef       = 0x920u;      // per-weapon def ptr (in-game gate)
+inline constexpr uint32_t kOffClip            = 0x954u;      // current-weapon clip
+inline constexpr uint32_t kOffListHead        = 0x128cu;     // -> carried-list head node
 
-// Carried-weapons doubly-linked list. A fixed field in the player entity points
-// at the head node; each 20-byte node is {flag, weapon id, 0xcccccccc, next,
-// prev}. Walking `next` enumerates every carried weapon (the list is circular).
-// Confirmed by a pickup diff (picking up a weapon adds a node with its id).
-inline constexpr uint32_t kWeaponListHeadPtr = 0x447f1a2cu;  // -> head node
-inline constexpr uint32_t kNodeIdOff         = 0x04u;        // node: 32-bit weapon id
-inline constexpr uint32_t kNodeNextOff       = 0x0cu;        // node: 32-bit next ptr
+// Carried-weapons doubly-linked list node layout. Each 20-byte node is
+// {flag, weapon id, 0xcccccccc, next, prev}; walking `next` enumerates every
+// carried weapon (circular list). Confirmed by a pickup diff.
+inline constexpr uint32_t kNodeIdOff          = 0x04u;       // node: 32-bit weapon id
+inline constexpr uint32_t kNodeNextOff        = 0x0cu;       // node: 32-bit next ptr
 
 // Equip write target: the per-frame field the game reads to switch weapon (same
 // one a weapon-cycle input sets). 0 => write path disabled (requests dropped).
@@ -653,24 +658,51 @@ void diag_snapshot(uint32_t frame, int ok_mask, uint32_t id_u, uint32_t id2_u,
       clip <= 4000u, defp >= 0x82000000u && defp < 0x84000000u, in_game, held);
 }
 
+// Resolve the LOCAL console's player entity: the one whose viewport offset
+// (+0x904) reads 0 (GoldenEye's own "current player == active viewport" signal,
+// same as the mouse-look targeting). Returns 0 if none is live (menus/boot).
+// This makes the weapon block per-player: host resolves to players[0], online
+// clients to players[1..3], so each reads its OWN weapon (fixes client cycling).
+inline uint32_t find_local_player(uint8_t* base) {
+  for (int i = 0; i < 4; ++i) {
+    uint32_t p = 0;
+    if (!safe_ld32(base, kPlayerArrayAddr + i * 4u, &p)) return 0;
+    if (!plausible_guest_ptr(p)) continue;
+    uint32_t vp = 0;
+    if (safe_ld32(base, p + kViewportOff, &vp) && vp == 0u) return p;
+  }
+  return 0;
+}
+
 // --- read path: build a snapshot from guest memory --------------------------
 WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
   WeaponSnapshot s{};
   s.frame = frame;
 
-  // DIRECT path (confirmed): the equipped-weapon block is at a fixed guest addr.
-  // Publish a one-weapon snapshot (equipped weapon + its clip) until the full
-  // per-weapon inventory array is mapped. Gated so we only publish valid=true
+  // DIRECT path (confirmed): the equipped-weapon block lives inside the player
+  // entity struct at fixed offsets. Read it relative to the LOCAL player so
+  // online clients see their own weapon (not the host's). Publish a one-weapon
+  // snapshot (equipped weapon + its clip) gated so we only publish valid=true
   // when the block clearly holds a live in-game weapon, not title-screen junk.
-  if (kEquipIdAddr != 0u) {
+  if (kWeaponBlockEnabled) {
+    const uint32_t player = find_local_player(base);
+    if (!player) {
+      diag_snapshot(frame, 0, 0, 0, 0, 0, false, 0);
+      return s;
+    }
+    const uint32_t equip_addr = player + kOffEquipId;
+    const uint32_t equip2_addr = player + kOffEquipId2;
+    const uint32_t clip_addr = player + kOffClip;
+    const uint32_t def_addr = player + kOffWeaponDef;
+    const uint32_t list_head_addr = player + kOffListHead;
     // EVERY read here is fault-safe (safe_ld32): the recomp's GPU write-watch
     // guard pages make a raw deref of a stray guest pointer trip an infinite
     // retry that hard-locks the game. If the entity can't be read, stay inert.
     uint32_t id_u = 0, id2_u = 0, clip = 0, defp = 0;
-    const bool ok_id   = safe_ld32(base, kEquipIdAddr, &id_u);
-    const bool ok_id2  = safe_ld32(base, kEquipIdAddr2, &id2_u);
-    const bool ok_clip = safe_ld32(base, kClipAddr, &clip);
-    const bool ok_def  = safe_ld32(base, kWeaponDefAddr, &defp);
+    const bool ok_id   = safe_ld32(base, equip_addr, &id_u);
+    const bool ok_id2  = safe_ld32(base, equip2_addr, &id2_u);
+    const bool ok_clip = safe_ld32(base, clip_addr, &clip);
+    const bool ok_def  = safe_ld32(base, def_addr, &defp);
     const int ok_mask  = (ok_id << 3) | (ok_id2 << 2) | (ok_clip << 1) | (int)ok_def;
     if (!(ok_id && ok_id2 && ok_clip && ok_def)) {
       diag_snapshot(frame, ok_mask, id_u, id2_u, clip, defp, false, 0);
@@ -692,7 +724,7 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
       // an unreadable/stale node just stops the walk (we fall back to equipped-only
       // below), so a corrupt list can never lock the game.
       uint32_t head = 0, node = 0, mask = 0;
-      if (safe_ld32(base, kWeaponListHeadPtr, &head)) {
+      if (safe_ld32(base, list_head_addr, &head)) {
         node = head;
         for (int guard = 0; guard < kMaxWeaponSlots; ++guard) {
           uint32_t wid_u;
