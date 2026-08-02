@@ -1125,24 +1125,43 @@ class GameInputListener final : public rex::ui::WindowInputListener,
         w->ReleaseMouse();
       });
     }
-    if (captured_) {
-      // Re-center each tick (prevents edge clamping). Seed prev to the center
-      // first so the warp's echoed OnMouseMove yields a zero delta.
-      const int cx = static_cast<int>(window_->GetActualLogicalWidth() / 2);
-      const int cy = static_cast<int>(window_->GetActualLogicalHeight() / 2);
-      { std::lock_guard<std::mutex> l(m_); prev_x_ = cx; prev_y_ = cy; have_prev_ = true; }
-      rex::ui::Window* w = window_;
-      w->app_context().CallInUIThread([w, cx, cy] { w->WarpMouseToClient(cx, cy); });
-    }
+    // NB: the per-frame recenter is NOT done here. On the warp-based path
+    // (Win32, absolute WM_MOUSEMOVE) it must happen in OnMouseMove on the UI
+    // thread, synchronously with reading the position -- doing it here (guest
+    // thread, ~187Hz, with an async cross-thread warp) scrambled the deltas
+    // because real moves arrived against a not-yet-warped cursor, so look
+    // "barely moved then stopped". The raw-delta path (X11 XI2 / Wayland) needs
+    // no warp at all.
   }
 
-  // WindowInputListener
+  // WindowInputListener (runs on the UI thread).
   void OnMouseMove(rex::ui::MouseEvent& e) override {
     std::lock_guard<std::mutex> l(m_);
-    if (raw_motion_) return;  // raw XI2 deltas drive look; warped positions are noise
-    const int x = e.x(), y = e.y();
-    if (have_prev_) { dx_ += float(x - prev_x_); dy_ += float(y - prev_y_); }
-    prev_x_ = x; prev_y_ = y; have_prev_ = true;
+    if (raw_motion_) return;  // raw XI2/Wayland deltas drive look; warped positions are noise
+    if (!captured_) {
+      // Not capturing: just track absolute position (menus don't use this path).
+      prev_x_ = e.x(); prev_y_ = e.y(); have_prev_ = true;
+      return;
+    }
+    // Warp-based capture (Win32): accumulate the offset from the window centre,
+    // then recenter the cursor. The warp echo arrives back at the centre and so
+    // contributes a zero delta. WarpMouseToClient is safe here: OnMouseMove is
+    // dispatched from the Win32 WndProc on the UI thread, so this warp nests
+    // LIFO under that handler's own WindowDestructionReceiver (same thread).
+    if (!window_) return;
+    const int cx = static_cast<int>(window_->GetActualLogicalWidth() / 2);
+    const int cy = static_cast<int>(window_->GetActualLogicalHeight() / 2);
+    // Skip the accumulation on the first event after capture began: the cursor
+    // may be anywhere, so that first offset is not real look motion. Just warp
+    // to centre and start measuring from there.
+    if (have_prev_) {
+      dx_ += float(e.x() - cx);
+      dy_ += float(e.y() - cy);
+    }
+    have_prev_ = true;
+    if (e.x() != cx || e.y() != cy) {
+      window_->WarpMouseToClient(cx, cy);
+    }
   }
   // Raw unaccelerated deltas (X11 XI2 while captured). Once these flow, the
   // position-difference path above is skipped: it double-counts the same
