@@ -777,6 +777,16 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // threads yield-spin -- making the proven-good desktop yield path correct on
     // arm64 too. Keep the yield; the rexglue handshake API stays defined as a
     // cheap escape hatch if the priority boost ever proves insufficient.
+    //
+    // NB (2026): re-confirmed. Swapping this yield for a short-timeout blocking
+    // rex_ge_cp_wait_progress (to cut CPU burn / fan noise) intermittently
+    // reintroduced the guest-render freeze on desktop (UI/ESC thread stayed
+    // alive, render wedged). This routine can hold the device spinlock other
+    // guest threads block on, so sleeping here shifts lock-hold timing and can
+    // deadlock the completion path. Do not replace the yield without solving
+    // that lock-ordering problem first. (The earlier fear that the yield was the
+    // fps ceiling was wrong: it was debug-build overhead -- Release + LTO holds
+    // 60.)
     if (!drawn) {
       std::this_thread::yield();
     }
