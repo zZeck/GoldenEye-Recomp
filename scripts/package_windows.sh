@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 #
-# package_windows.sh -- bundle the Windows (llvm-mingw) Release build plus the
-# game assets into a distributable zip for Windows users.
+# package_windows.sh -- bundle the Windows (llvm-mingw) Release build into a
+# distributable zip for Windows users, optionally with the game assets.
 #
 # Contents of the zip:
 #   GoldenEye.exe + runtime DLLs (librexruntime.dll, libc++.dll, libunwind.dll,
-#   libTracyClient.dll) from the win-amd64 Release build, plus the game data
-#   (default.xex, files/, music.*, sfx.*, ArcadeInfo.xml, images) and a default
-#   ge.toml, laid out so the user just unzips and runs GoldenEye.exe.
+#   libTracyClient.dll) from the win-amd64 Release build, a default ge.toml, and
+#   a README -- laid out so the user just unzips and runs GoldenEye.exe.
+#   By default the game data (the exe-adjacent assets/ folder) is included; pass
+#   --no-assets to ship a binaries-only zip (the user drops in their own assets/).
 #
 # Usage:
-#   scripts/package_windows.sh [output.zip]
-# Defaults to dist/GoldenEye-win64-<git-describe>.zip
+#   scripts/package_windows.sh [--no-assets] [output.zip]
+# Defaults to dist/GoldenEye-win64[-nodata]-<git-describe>.zip
 #
 set -euo pipefail
+
+# --- args --------------------------------------------------------------------
+INCLUDE_ASSETS=1
+OUT_ARG=""
+for arg in "$@"; do
+  case "${arg}" in
+    --no-assets) INCLUDE_ASSETS=0 ;;
+    --with-assets) INCLUDE_ASSETS=1 ;;
+    -h|--help)
+      echo "usage: scripts/package_windows.sh [--no-assets] [output.zip]" >&2
+      exit 0 ;;
+    *) OUT_ARG="${arg}" ;;
+  esac
+done
 
 # Repo root = parent of this script's dir.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,14 +86,18 @@ for b in "${BINARIES[@]}"; do
   cp -a "${BUILD_DIR}/${b}" "${STAGE}/"
 done
 
-echo "Staging game assets from ${ASSET_DIR}"
-for a in "${ASSETS[@]}"; do
-  if [[ -e "${ASSET_DIR}/${a}" ]]; then
-    cp -a "${ASSET_DIR}/${a}" "${STAGE}/"
-  else
-    echo "  note: asset '${a}' not present, skipping" >&2
-  fi
-done
+if [[ "${INCLUDE_ASSETS}" -eq 1 ]]; then
+  echo "Staging game assets from ${ASSET_DIR}"
+  for a in "${ASSETS[@]}"; do
+    if [[ -e "${ASSET_DIR}/${a}" ]]; then
+      cp -a "${ASSET_DIR}/${a}" "${STAGE}/"
+    else
+      echo "  note: asset '${a}' not present, skipping" >&2
+    fi
+  done
+else
+  echo "Skipping game assets (--no-assets): binaries-only package"
+fi
 
 # Ship a clean default config (not the developer's local ge.toml). Console
 # subsystem build logs to stdout; users can raise log_level if needed.
@@ -90,12 +109,28 @@ window_height = 1080
 ge_online_enable = true
 TOML
 
-# Short player-facing readme.
-cat > "${STAGE}/README.txt" <<'TXT'
+# Short player-facing readme. The "game files" paragraph differs depending on
+# whether assets were bundled.
+{
+  cat <<'TXT'
 GoldenEye (Windows build)
 =========================
+TXT
+  if [[ "${INCLUDE_ASSETS}" -eq 1 ]]; then
+    cat <<'TXT'
 
 Just unzip and run GoldenEye.exe. Everything needed is in this folder.
+TXT
+  else
+    cat <<'TXT'
+
+This package contains only the program (no game data). To play:
+  1. Put your GoldenEye game files in a folder named "assets" NEXT TO
+     GoldenEye.exe (so you have GoldenEye/assets/default.xex, etc.).
+  2. Run GoldenEye.exe.
+TXT
+  fi
+  cat <<'TXT'
 
 Controls
   - Gamepad works out of the box.
@@ -112,10 +147,16 @@ Notes
 This is an unofficial fan project and is not affiliated with or endorsed by
 the rights holders. See the project page for source and credits.
 TXT
+} > "${STAGE}/README.txt"
 
 # --- Zip ---------------------------------------------------------------------
 VERSION="$(git -C "${REPO}" describe --tags --always --dirty 2>/dev/null || echo unknown)"
-OUT="${1:-${REPO}/dist/GoldenEye-win64-${VERSION}.zip}"
+if [[ "${INCLUDE_ASSETS}" -eq 1 ]]; then
+  DEFAULT_OUT="${REPO}/dist/GoldenEye-win64-${VERSION}.zip"
+else
+  DEFAULT_OUT="${REPO}/dist/GoldenEye-win64-nodata-${VERSION}.zip"
+fi
+OUT="${OUT_ARG:-${DEFAULT_OUT}}"
 mkdir -p "$(dirname "${OUT}")"
 rm -f "${OUT}"
 
