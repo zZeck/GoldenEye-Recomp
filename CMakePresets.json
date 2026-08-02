@@ -28,8 +28,8 @@
             "generator": "Ninja Multi-Config",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "cacheVariables": {
-                "CMAKE_C_COMPILER": "clang",
-                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_COMPILER": "/usr/lib/llvm/22/bin/clang",
+                "CMAKE_CXX_COMPILER": "/usr/lib/llvm/22/bin/clang++",
                 "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
                 "CMAKE_DEFAULT_BUILD_TYPE": "Release",
                 "REXSDK_DIR": "${sourceDir}/GoldenEye-Recomp-rexglue"
