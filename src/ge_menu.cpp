@@ -720,6 +720,20 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
                          "(controller still works; cursor is captured in-game, freed in this menu)");
 
       ImGui::Spacing();
+
+      // Controller vibration toggle. Live: the runtime applies controller_vibration
+      // centrally in InputSystem::SetState, so turning it off both stops the
+      // current rumble request and cancels any the guest left running -- across
+      // SDL / XInput / Android backends.
+      bool vibrate = GetCvarB("controller_vibration");
+      if (ImGui::Checkbox("Controller vibration", &vibrate)) {
+        SetCvarB("controller_vibration", vibrate);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(on = allow rumble; off = disable controller vibration)");
+
+      ImGui::Spacing();
       ImGui::Separator();
       ImGui::Spacing();
 
