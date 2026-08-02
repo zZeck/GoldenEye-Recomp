@@ -81,8 +81,8 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   const char* rebinding_cvar_ = nullptr;
   int rebind_skip_ = 0;
 
-  // Placeholder audio state (engine wiring comes later).
-  float vol_master_ = 0.80f;
+  // Placeholder audio state for the not-yet-wired Music / Sound FX sliders.
+  // (Master Volume is wired directly to the master_volume cvar.)
   float vol_music_ = 0.70f;
   float vol_sfx_ = 0.85f;
 

@@ -328,11 +328,22 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
 
   switch (selected_tab_) {
     case 0:  // AUDIO
-      ImGui::SliderFloat("Master Volume", &vol_master_, 0.0f, 1.0f, "%.2f");
+      // Master Volume drives the master_volume cvar (live linear output gain in
+      // the SDL mix callback). Read it fresh so external changes are reflected,
+      // and persist on edit so it survives a restart.
+      {
+        float master = GetCvarF("master_volume");
+        if (ImGui::SliderFloat("Master Volume", &master, 0.0f, 1.0f, "%.2f")) {
+          SetCvarF("master_volume", master);
+          if (callbacks_.persist_config) callbacks_.persist_config();
+        }
+      }
+      // Music / Sound FX are not yet wired to the guest mixer (no cvar exists);
+      // left as previews until the engine-side split is implemented.
       ImGui::SliderFloat("Music", &vol_music_, 0.0f, 1.0f, "%.2f");
       ImGui::SliderFloat("Sound FX", &vol_sfx_, 0.0f, 1.0f, "%.2f");
       ImGui::Spacing();
-      ImGui::TextColored(ImColor(kInkDim), "(preview - engine wiring WIP)");
+      ImGui::TextColored(ImColor(kInkDim), "(Music / Sound FX preview - engine wiring WIP)");
       break;
     case 1: {  // VIDEO
       // --- Fullscreen (live; the request is applied deferred, off the paint
