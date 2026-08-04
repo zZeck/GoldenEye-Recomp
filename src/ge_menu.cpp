@@ -721,6 +721,20 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
 
       ImGui::Spacing();
 
+      // Hipfire crosshair. Drives the game's OWN crosshair (native gunDrawSight)
+      // during hipfire by clearing the NOTAIMING sight-hide bit -- no overlay,
+      // no present-path change. Auto-hides on menus / cutscenes / damage via the
+      // engine's other sight reasons. Live: the sight hook reads this each frame.
+      bool xhair = GetCvarB("ge_crosshair");
+      if (ImGui::Checkbox("Hipfire crosshair", &xhair)) {
+        SetCvarB("ge_crosshair", xhair);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(show the game's crosshair during hipfire, not only when aiming)");
+
+      ImGui::Spacing();
+
       // Controller vibration toggle. Live: the runtime applies controller_vibration
       // centrally in InputSystem::SetState, so turning it off both stops the
       // current rumble request and cancels any the guest left running -- across

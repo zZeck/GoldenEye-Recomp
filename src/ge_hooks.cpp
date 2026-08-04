@@ -217,6 +217,11 @@ extern "C" uint64_t rex_ge_cp_progress_seq();
 // ge_dbg_weapon_apply (below) can gate its logging without a header dependency.
 REXCVAR_DECLARE(bool, ge_gamestate_diag);
 
+// Hipfire crosshair toggle. Defined further down with the other Input cvars
+// (near ge_mouselook_enable); forward-declared here so the ge_sight_visible
+// hook above that definition can read it.
+REXCVAR_DECLARE(bool, ge_crosshair);
+
 // CP-starvation episodes observed by the watchdog (ring non-empty but the CP
 // progress seq did not advance across a 250ms watchdog tick). Coarse by design
 // -- fine-grained starvation shows up as missing time in the per-frame CP
@@ -904,6 +909,27 @@ void ge_hook_830E0670(PPCRegister& r3, PPCRegister& r11, PPCRegister& r28) {
   ge_cont_8209F5F4(*ctx, base);
 }
 
+// Native hipfire crosshair. Entry of gunSetSightVisible (sub_820A64C0):
+//   if (visible) player->gunsightmode &= ~reason; else player->gunsightmode |= reason;
+// The crosshair draw (sub_820A64F0) renders the reticle only while the sight
+// gunsightmode at player offset 0x11DC == 0. Every control tick the bond tick
+// calls this with reason=GUNSIGHTREASON_NOTAIMING(0x02), visible=aiming, which
+// sets the bit during hipfire and hides the crosshair. When ge_crosshair is on,
+// force visible=1 for that one reason so the bit is cleared -> the game draws
+// its own crosshair in hipfire too. Every other reason (NOCONTROL 0x04 /
+// DAMAGE 0x10 / sight-option 0x01) and the mpmenuon guard are untouched, so the
+// reticle still hides on menus, cutscenes, and damage. Runs on the guest thread
+// as part of the native call -- no overlay, no present-path change.
+// NB: sub_820A5560 is the identical-shape SIBLING for the ammo HUD (offset
+// 0x111C) -- we hook 0x820A64C0, the crosshair one (offset 0x11DC).
+constexpr uint32_t GE_SIGHTREASON_NOTAIMING = 0x02u;
+void ge_sight_visible(PPCRegister& r3, PPCRegister& r4) {
+  if (REXCVAR_GET(ge_crosshair) && (r3.u32 & GE_SIGHTREASON_NOTAIMING) &&
+      r4.u32 == 0u) {
+    r4.u32 = 1u;  // force "visible" so the NOTAIMING hide-bit is cleared
+  }
+}
+
 // F1  0x830E0630: the r30++ (with 3/6 skip) loop-increment fragment. Hooked at
 // the branch site 0x820F774C; the config jump_address sends control back to
 // 0x820F7750 (cmpwi r30,8 / blt loc_820F768C) IN THE PARENT sub_820F73F8, so the
@@ -1038,6 +1064,11 @@ REXCVAR_DEFINE_DOUBLE(ge_menu_sensitivity, 1.0, "Input",
 REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
                       "Crosshair travel in aim-mode before the camera turns [0-1]").range(0.0, 1.0);
 REXCVAR_DEFINE_BOOL(ge_gun_sway, true, "Input", "Gun sway as the camera turns");
+// Show the game's own crosshair during hipfire (not just in aim mode). Drives
+// the native gunDrawSight via the ge_sight_visible hook -- no overlay. Off by
+// default (matches the classic game: hipfire shows no reticle).
+REXCVAR_DEFINE_BOOL(ge_crosshair, false, "Input",
+                    "Show the game's crosshair during hipfire (not only when aiming)");
 
 REXCVAR_DEFINE_DOUBLE(ge_mouse_sens, 1.0, "Input", "Mouse look sensitivity").range(0.05, 20.0);
 REXCVAR_DEFINE_DOUBLE(ge_mouse_smooth, 0.0, "Input",

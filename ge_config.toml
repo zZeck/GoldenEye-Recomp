@@ -129,6 +129,25 @@ address = 0x823B25E4
 name = "ge_inject_keyboard"
 registers = ["r11"]
 after_instruction = true
+# HIPFIRE CROSSHAIR: entry of gunSetSightVisible (sub_820A64C0).
+#   void gunSetSightVisible(s32 reason /*r3*/, bool visible /*r4*/) {
+#     if (visible) player->gunsightmode &= ~reason; else |= reason;  // 0x11DC
+#   }
+# The crosshair draw (sub_820A64F0) renders the reticle only while
+# gunsightmode(0x11DC)==0 (& not mpmenuon 0x2044). Every control tick the bond
+# tick (sub_820B99E8) calls this with reason=NOTAIMING(0x02), visible=aiming ->
+# so bit 0x02 is set during hipfire, hiding the crosshair. When ge_crosshair is
+# on, force visible=1 for the NOTAIMING reason so the game's own reticle stays up
+# in hipfire. All other reasons (NOCONTROL 0x04 / DAMAGE 0x10 / sight-option 0x01)
+# and the mpmenuon guard pass through, so it still hides on menus/cutscenes/damage.
+# NB: sub_820A5560 is the IDENTICAL-shape SIBLING for the ammo HUD (offset 0x111C)
+# -- do NOT hook that one. Identified statically from the generated recomp,
+# matching n64decomp/007 gun.c gunSetSightVisible/gunDrawSight.
+[[midasm_hook]]
+address = 0x820A64C0
+name = "ge_sight_visible"
+registers = ["r3", "r4"]
+after_instruction = false
 # Phase-1 discovery (weapon direct-switch RE): entry of sub_820A7508, the
 # per-hand weapon applier. Logs caller lr + args; diag-gated in ge_hooks.cpp.
 [[midasm_hook]]

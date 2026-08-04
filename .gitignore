@@ -65,3 +65,6 @@ android/local.properties
 /GoldenEye-Recomp-FSR-fork/
 
 .opencode/
+
+# --- Local RE / investigation notes (not committed) ---
+/research/
