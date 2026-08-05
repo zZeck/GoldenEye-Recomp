@@ -24,7 +24,7 @@
         },
         {
             "name": "linux-amd64",
-            "displayName": "Linux AMD64 (native clang)",
+            "displayName": "Linux AMD64 (native clang, -march=native)",
             "generator": "Ninja Multi-Config",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "cacheVariables": {
@@ -32,12 +32,24 @@
                 "CMAKE_CXX_COMPILER": "/usr/lib/llvm/22/bin/clang++",
                 "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
                 "CMAKE_DEFAULT_BUILD_TYPE": "Release",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE": "ON",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO": "ON",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG": "OFF",
                 "REXSDK_DIR": "${sourceDir}/GoldenEye-Recomp-rexglue"
             },
             "condition": {
                 "type": "equals",
                 "lhs": "${hostSystemName}",
                 "rhs": "Linux"
+            }
+        },
+        {
+            "name": "linux-amd64-portable",
+            "displayName": "Linux AMD64 (portable, -march=x86-64-v3)",
+            "inherits": "linux-amd64",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "GE_MARCH": "x86-64-v3"
             }
         }
     ],
@@ -77,6 +89,18 @@
             "displayName": "Linux AMD64 RelWithDebInfo",
             "configurePreset": "linux-amd64",
             "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-amd64-portable-release",
+            "displayName": "Linux AMD64 Portable Release (x86-64-v3)",
+            "configurePreset": "linux-amd64-portable",
+            "configuration": "Release"
+        },
+        {
+            "name": "linux-amd64-portable-debug",
+            "displayName": "Linux AMD64 Portable Debug (x86-64-v3)",
+            "configurePreset": "linux-amd64-portable",
+            "configuration": "Debug"
         }
     ]
 }
