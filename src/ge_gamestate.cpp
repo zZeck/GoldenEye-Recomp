@@ -651,11 +651,11 @@ void diag_snapshot(uint32_t frame, int ok_mask, uint32_t id_u, uint32_t id2_u,
   primed = true;
   REXKRNL_INFO(
       "GEGAMESTATE frame={} memfd={} errno={} reads(id/id2/clip/def)={:04b} "
-      "id={:#x} id2={:#x} clip={} defp={:#x} | gate: agree={} slot={} clip_ok={} "
-      "def_ok={} => in_game={} held={}",
+      "id={:#x} id2={:#x} clip={} defp={:#x} | gate: agree={} slot={} "
+      "def_ok={} => in_game={} held={} (clip not gated)",
       frame, bridge_memfd(), bridge_last_errno(), ok_mask, id_u, id2_u, clip, defp,
       id_u == id2_u, (int32_t)id_u >= 0 && (int32_t)id_u < kMaxWeaponSlots,
-      clip <= 4000u, defp >= 0x82000000u && defp < 0x84000000u, in_game, held);
+      defp >= 0x82000000u && defp < 0x84000000u, in_game, held);
 }
 
 // Resolve the LOCAL console's player entity: the one whose viewport offset
@@ -711,10 +711,17 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
     int32_t id  = static_cast<int32_t>(id_u);
     int32_t id2 = static_cast<int32_t>(id2_u);
 
-    // In-game gate: the two equipped-id copies agree, the id is a real slot, the
-    // clip is sane, and the per-weapon def pointer points into the guest module.
+    // In-game gate: the two equipped-id copies agree, the id is a real slot, and
+    // the per-weapon def pointer points into the guest module. The clip is NOT
+    // gated on: it's a signed field that legitimately goes negative for gadgets
+    // (the remote-mine detonator, id 0x1e, counts down past zero as you detonate:
+    // -1, -2, -4, ... read as huge unsigned), and gating on it only ever produced
+    // false negatives that dead-locked the weapon wheel until a native Y press.
+    // The id-agreement + slot-range + def-pointer terms already reject boot/menu
+    // junk (observed: id2=0xCCCCCCCC fails agree; defp=0xCCCCCCCC/0x0 fails def),
+    // so the clip adds no real gating -- it's read below for ammo only.
+    const int32_t clip_s = static_cast<int32_t>(clip);
     const bool in_game = (id == id2) && id >= 0 && id < kMaxWeaponSlots &&
-                         clip <= 4000u &&
                          (defp >= 0x82000000u && defp < 0x84000000u);
     if (in_game) {
       s.equipped_id = id;
@@ -749,8 +756,9 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
       s.held_mask = mask;
 
       // Ammo: only the equipped weapon's clip is known so far (the per-weapon
-      // reserve pool is not mapped yet), so other slots stay 0.
-      s.ammo[id] = static_cast<uint16_t>(clip);
+      // reserve pool is not mapped yet), so other slots stay 0. Clamp a negative
+      // (gadget "no ammo" countdown) to 0 rather than truncating to a huge value.
+      s.ammo[id] = clip_s < 0 ? 0u : static_cast<uint16_t>(clip_s);
       s.valid = (s.held_count > 0);
     }
     diag_snapshot(frame, ok_mask, id_u, id2_u, clip, defp, in_game, s.held_count);
