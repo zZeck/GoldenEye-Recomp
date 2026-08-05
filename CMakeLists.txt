@@ -80,3 +80,17 @@ if(NOT WIN32)
 endif()
 
 rexglue_setup_target(ge)
+
+# Optimize the game-side translation units in optimized configs. The SDK drives
+# -O3/-DNDEBUG through its own directory-scoped add_compile_options, which does
+# NOT reach this parent 'ge' target. On Windows the llvm-mingw build inherits
+# CMake's default CMAKE_CXX_FLAGS_RELEASE (-O3 -DNDEBUG), but the Linux clang
+# cache leaves it empty, so without this the Linux game exe (ge_hooks.cpp,
+# ge_gamestate.cpp, main.cpp, ...) was built at -O0 with asserts live. Match the
+# SDK explicitly so both platforms optimize the game code identically.
+target_compile_options(ge PRIVATE
+    $<$<CONFIG:RELEASE>:-O3>
+    $<$<CONFIG:RELEASE>:-DNDEBUG>
+    $<$<CONFIG:RELWITHDEBINFO>:-O3>
+    $<$<CONFIG:RELWITHDEBINFO>:-DNDEBUG>
+)
